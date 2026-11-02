@@ -1,0 +1,19 @@
+# build output
+src-tauri/target/
+src-tauri/gen/
+__pycache__/
+.pytest_cache/
+.venv/
+
+# secrets: never commit these
+.env
+.env.*
+!.env.example
+*.token
+fyers_token*.json
+*.har
+
+# your data and local tool config
+journal.db
+.parity_frames.json
+.claude/

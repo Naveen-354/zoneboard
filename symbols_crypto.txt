@@ -1,0 +1,33 @@
+# Binance spot pairs for the live crypto board, one per line. Lines starting with # are ignored.
+# Any valid Binance symbol works: add or remove names freely. A name Binance doesn't list is skipped.
+# You can also type any other pair in the board's search box and press Enter to open it.
+BTCUSDT
+ETHUSDT
+BNBUSDT
+SOLUSDT
+XRPUSDT
+DOGEUSDT
+ADAUSDT
+TRXUSDT
+AVAXUSDT
+LINKUSDT
+DOTUSDT
+POLUSDT
+LTCUSDT
+BCHUSDT
+NEARUSDT
+UNIUSDT
+ATOMUSDT
+APTUSDT
+ARBUSDT
+OPUSDT
+SUIUSDT
+INJUSDT
+FILUSDT
+ETCUSDT
+XLMUSDT
+HBARUSDT
+AAVEUSDT
+SHIBUSDT
+PEPEUSDT
+TONUSDT

@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>ZoneBoard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='7' fill='%234f46e5'/%3E%3Cpath d='M8.5 5.5v13M15.5 4v14' stroke='%23fff' stroke-width='1.6' stroke-linecap='round'/%3E%3Crect x='6.5' y='9' width='4' height='6' rx='1' fill='%23fff'/%3E%3Crect x='13.5' y='7' width='4' height='7' rx='1' fill='%23a5b4fc'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="preconnect" href="https://data-api.binance.vision">
+<link rel="preconnect" href="https://data-stream.binance.vision">
+<!-- Preload the whole module graph at once instead of discovering it one import level at a time. -->
+<link rel="modulepreload" href="/static/js/main.js">
+<link rel="modulepreload" href="/static/js/util.js">
+<link rel="modulepreload" href="/static/js/board.js">
+<link rel="modulepreload" href="/static/js/chart.js">
+<link rel="modulepreload" href="/static/js/view.js">
+<link rel="modulepreload" href="/static/js/journal.js">
+<link rel="modulepreload" href="/static/js/markets/crypto.js">
+<link rel="modulepreload" href="/static/js/markets/india.js">
+<link rel="modulepreload" href="/static/js/feed.js">
+<link rel="modulepreload" href="/static/js/zones.js">
+<link rel="preload" href="/api/config" as="fetch" crossorigin>
+<script defer src="/static/vendor/lightweight-charts.5.2.1.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect width="24" height="24" rx="7" fill="#4f46e5"/><path d="M8.5 5.5v13M15.5 4v14" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/><rect x="6.5" y="9" width="4" height="6" rx="1" fill="#fff"/><rect x="13.5" y="7" width="4" height="7" rx="1" fill="#a5b4fc"/></svg>
+    <span>Zone<b>Board</b></span>
+  </div>
+  <div class="seg" id="market" role="tablist" aria-label="Market">
+    <button type="button" data-m="crypto" class="on">Crypto <em class="tag live">LIVE</em></button>
+    <button type="button" data-m="india">India NSE <em class="tag delay">15m delay</em></button>
+  </div>
+  <div class="seg" id="tabs" role="tablist" aria-label="View">
+    <button type="button" data-v="board" class="on">Board</button>
+    <button type="button" data-v="journal">Journal</button>
+  </div>
+  <div class="conn" id="conn"><i class="dot"></i><span id="connText">Connecting…</span></div>
+</header>
+
+<div class="banner" id="banner" hidden></div>
+
+<main class="layout" id="boardView">
+  <aside class="card board" id="board">
+    <div class="board-head">
+      <div class="pulse">
+        <div><b id="cBull" class="up">–</b><small>Bullish</small></div>
+        <div><b id="cBear" class="dn">–</b><small>Bearish</small></div>
+        <div><b id="cChop">–</b><small>Choppy</small></div>
+      </div>
+      <div class="ctl">
+        <div class="seg sm" id="boardMode">
+          <button type="button" data-b="setups" class="on">Setups</button>
+          <button type="button" data-b="all">All</button>
+        </div>
+        <label id="boardTfWrap">Timeframe <select id="boardTf" aria-label="Board timeframe"></select></label>
+      </div>
+      <input class="search" id="search" type="search" placeholder="Search symbol   ( / )" autocomplete="off" spellcheck="false" maxlength="20">
+    </div>
+    <div class="board-body" id="boardBody">
+      <div id="setups">
+        <h2>Strongest bullish</h2><div id="bullList"></div>
+        <h2>Strongest bearish</h2><div id="bearList"></div>
+      </div>
+      <div id="allList" hidden></div>
+    </div>
+  </aside>
+
+  <section class="card view">
+    <div class="view-head">
+      <div class="title"><span id="sym">Pick a symbol</span><span id="symName"></span></div>
+      <div class="price"><b id="px"></b><span id="pxChg"></span></div>
+      <div class="spacer"></div>
+      <div class="seg sm" id="tf" aria-label="Chart timeframe"></div>
+      <div class="toggles">
+        <button type="button" class="chip-btn on" id="tZones">Zones</button>
+        <button type="button" class="chip-btn on" id="tLevels">Levels</button>
+      </div>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="chart-wrap">
+      <div id="chart"></div>
+      <div class="legend" id="legend"></div>
+      <div class="msg" id="msg"></div>
+    </div>
+  </section>
+</main>
+
+<main class="journal" id="journalView" hidden>
+  <div class="banner err" id="jerr" hidden style="margin:0"></div>
+  <div class="card">
+    <form class="j" id="jform">
+      <label>Date<input type="date" name="date" required></label>
+      <label>Symbol<input name="symbol" placeholder="BTCUSDT" required maxlength="20" autocomplete="off"></label>
+      <label>Side<select name="side"><option value="long">Long</option><option value="short">Short</option></select></label>
+      <label>Quantity<input name="qty" type="number" min="0" step="any" placeholder="Qty" required></label>
+      <label>Entry<input name="entry" type="number" min="0" step="any" placeholder="Entry" required></label>
+      <label>Exit<input name="exit" type="number" min="0" step="any" placeholder="Exit" required></label>
+      <label>Fees<input name="fees" type="number" min="0" step="any" placeholder="Fees + taxes"></label>
+      <label>Notes<input name="notes" placeholder="Why, what you felt" maxlength="500"></label>
+      <button class="btn" type="submit">Add trade</button>
+    </form>
+  </div>
+  <div class="stats" id="jstats"></div>
+  <div class="card table-wrap">
+    <table>
+      <thead><tr><th>Date</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Fees</th><th>P&amp;L</th><th>Notes</th><th></th></tr></thead>
+      <tbody id="jbody"></tbody>
+    </table>
+    <div class="empty-j" id="jempty" hidden>No trades yet for this market. Add one above.</div>
+  </div>
+</main>
+
+<footer>Educational tool, not investment advice. Order blocks and liquidity zones here are simple rule-based readings with no proven edge: backtest before risking money. Crypto data: Binance public market data. NSE data: Yahoo Finance, unofficial and delayed.</footer>
+
+<script type="module" src="/static/js/main.js"></script>
+</body>
+</html>
