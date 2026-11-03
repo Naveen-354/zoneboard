@@ -170,10 +170,12 @@ fn entry_user(account_id: &str, name: &str) -> String {
 /// Formats a key hint showing only the last 4 characters, prefixed with an ellipsis (`…`).
 ///
 /// This is the only representation of an API key the HTTP API may expose.
+/// Shows the last 4 characters only when the value has at least 8 characters; for anything
+/// shorter (including empty) returns just `…`.
 pub fn key_hint(api_key: &str) -> String {
     let count = api_key.chars().count();
-    if count <= 4 {
-        format!("…{api_key}")
+    if count < 8 {
+        "…".to_string()
     } else {
         let suffix: String = api_key.chars().skip(count - 4).collect();
         format!("…{suffix}")
@@ -571,10 +573,12 @@ mod tests {
     #[test]
     fn test_key_hint_formatting() {
         assert_eq!(key_hint("vmPUf294abcd"), "…abcd");
-        assert_eq!(key_hint("1234"), "…1234");
-        assert_eq!(key_hint("12"), "…12");
+        assert_eq!(key_hint("12345678"), "…5678");
+        assert_eq!(key_hint("1234567"), "…");
+        assert_eq!(key_hint("1234"), "…");
+        assert_eq!(key_hint("12"), "…");
         assert_eq!(key_hint(""), "…");
-        assert_eq!(key_hint("🦀🌟🚀🔑🎉"), "…🌟🚀🔑🎉");
+        assert_eq!(key_hint("🦀🌟🚀🔑🎉🔥✨🎯"), "…🎉🔥✨🎯");
 
         let sec = SecretString::from("very_secret_9999");
         assert_eq!(key_hint_secret(&sec), "…9999");
@@ -766,7 +770,7 @@ mod keychain_integration_tests {
             .expect("read 1280");
         assert_eq!(read_1280.expose_secret(), payload_1280);
 
-        // 6. Boundary: 1281 ASCII chars fails in real store
+        // 6. Boundary: 1281 ASCII chars fails in real store (rejected by check_secret_size before keyring is called; step 5 proves our limit is not set too high)
         let payload_1281 = "x".repeat(1281);
         let err = store2
             .put(account_id, "bound_1281", SecretString::from(payload_1281))
