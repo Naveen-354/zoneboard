@@ -28,3 +28,15 @@ Users, passwords, sessions, SSE, changing any route's behaviour.
 
 ## Notes
 Pre-approved dependencies: `subtle`, `rand`.
+
+## Plan review: corrections the implementation must follow (Claude, 2026-11-03)
+Antigravity's plan was reviewed and approved **with these changes**. Where it differs from the plan, this section wins.
+
+1. **No ETag and no 304 on `GET /`.** The plan derived the ETag from the token, which puts the token in a response header and breaks rule 5 ("only in the HTML meta tag"). Serve `GET /` with `Cache-Control: no-store` instead. Reason: a cached copy of the page would carry a dead token after the next restart (the desktop WebView keeps a persistent cache), and every API call would then fail. Static assets stay cacheable (they contain no token). Test: response headers on `GET /` contain no token and include `no-store`.
+2. **Route coverage must be impossible to forget.** Protect by path prefix (`/api` and `/api/*`) in the middleware, never per handler. Tests: (a) a table of every current API route and method: no token -> 401, wrong token -> 401, right token -> normal behaviour; (b) a path that matches no route (`/api/__unregistered__`) is also 401 without a token, which proves the protection is by prefix; (c) a source-scan test (`include_str!("../src/server.rs")`) that extracts every `.route("...")` path and asserts each one either starts with `/api/` and is in the table, or is in an explicit public allow-list (`/`, `/static/{*path}`). A new route outside those rules must fail this test.
+3. **A stale page must say so.** On a `401`, `api()` in `util.js` throws a clear message ("ZoneBoard was restarted or this page is stale: reload the page"), not a bare "unauthorized". The token changes on every launch, so an open tab breaks after a restart.
+4. **Decisions on the plan's questions:** removing `<link rel="preload" href="/api/config">` is approved (a preload cannot carry the header; note the small load-time cost in your report). `AppState::api_token()` is approved as a read-only accessor for tests; mark it `#[doc(hidden)]` and make sure no `Debug`, `Serialize` or log call can print it.
+5. **Dependencies:** `rand = "0.8"` (already in `Cargo.lock`; `rngs::OsRng` + `RngCore::fill_bytes`) and `subtle = "2"`. Nothing else. Do not move to `rand` 0.9 or 0.10 (their API differs).
+6. **SSE extension point:** one small function, for example `token_from_request(&Request) -> Option<&str>`, that returns the `X-ZB-Token` header today, with a comment saying where a future query-parameter variant for `EventSource` would go. Build nothing else.
+7. **Logging proof:** add a test that `logging::is_secret_field("X-ZB-Token")` is true, and make sure no code path logs header values.
+8. **Verification split:** you run the automated checks. Claude does the browser checks (token in the meta tag, header on requests, 401 on a bare fetch, 403 on a foreign Origin); do not try to drive a browser.
