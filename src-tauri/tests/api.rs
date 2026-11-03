@@ -327,7 +327,7 @@ async fn settings_put_validation_and_all_or_nothing() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(String::from_utf8_lossy(&b).contains("invalid timezone"));
 
-    // Case matters for timezone -> 400
+    // Case matters for timezone -> 400 (asia/kolkata must still be a 400)
     let (s, _, b) = call(&r, "PUT", "/api/settings", "localhost", Some(json!({ "timezone": "asia/kolkata" })), &[]).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(String::from_utf8_lossy(&b).contains("invalid timezone"));
@@ -358,4 +358,35 @@ async fn settings_put_validation_and_all_or_nothing() {
     let (s, res) = get_json(&r, "/api/settings").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(res["timezone"], "UTC");
+}
+
+#[tokio::test]
+async fn settings_unchanged_values_write_nothing() {
+    let r = router();
+
+    // 1. Initial PUT sets timezone to Asia/Kolkata
+    let (s, _, _) = call(&r, "PUT", "/api/settings", "localhost", Some(json!({ "timezone": "Asia/Kolkata" })), &[]).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Verify audit log has exactly 1 settings_update entry
+    let (s, audit) = get_json(&r, "/api/audit?limit=10").await;
+    assert_eq!(s, StatusCode::OK);
+    let entries = audit["entries"].as_array().unwrap();
+    let updates_count = entries.iter().filter(|e| e["action"] == "settings_update").count();
+    assert_eq!(updates_count, 1);
+
+    // 2. PUT timezone to Asia/Kolkata again -> unchanged, writes nothing
+    let (s, _, _) = call(&r, "PUT", "/api/settings", "localhost", Some(json!({ "timezone": "Asia/Kolkata" })), &[]).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // 3. PUT of an empty object {} adds none
+    let (s, _, _) = call(&r, "PUT", "/api/settings", "localhost", Some(json!({})), &[]).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Still exactly 1 settings_update row
+    let (s, audit) = get_json(&r, "/api/audit?limit=10").await;
+    assert_eq!(s, StatusCode::OK);
+    let entries = audit["entries"].as_array().unwrap();
+    let updates_count = entries.iter().filter(|e| e["action"] == "settings_update").count();
+    assert_eq!(updates_count, 1);
 }

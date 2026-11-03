@@ -306,10 +306,10 @@ async fn positions_close(State(s): State<Shared>, Path(id): Path<i64>, headers: 
     }
 }
 
-async fn audit_get(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+fn parse_audit_query(q: &HashMap<String, String>) -> Result<(usize, Option<i64>), String> {
     let limit = match q.get("limit") {
         Some(s) => match s.parse::<usize>() {
-            Ok(0) | Err(_) => return err(StatusCode::BAD_REQUEST, "limit must be a positive integer"),
+            Ok(0) | Err(_) => return Err("limit must be a positive integer".to_string()),
             Ok(n) => n.min(500),
         },
         None => 50,
@@ -318,9 +318,18 @@ async fn audit_get(State(s): State<Shared>, Query(q): Query<HashMap<String, Stri
     let before = match q.get("before") {
         Some(s) => match s.parse::<i64>() {
             Ok(id) if id > 0 => Some(id),
-            _ => return err(StatusCode::BAD_REQUEST, "before must be a positive integer"),
+            _ => return Err("before must be a positive integer".to_string()),
         },
         None => None,
+    };
+
+    Ok((limit, before))
+}
+
+async fn audit_get(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let (limit, before) = match parse_audit_query(&q) {
+        Ok(vals) => vals,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
 
     let result = s.journal.with_conn(|conn| crate::audit::list(conn, limit, before));
@@ -414,4 +423,57 @@ pub fn spawn() -> Result<u16, String> {
         })
         .map_err(|e| e.to_string())?;
     Ok(port)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_audit_query_limits_and_before() {
+        let mut q = HashMap::new();
+
+        // no limit -> 50, no before -> None
+        assert_eq!(parse_audit_query(&q), Ok((50, None)));
+
+        // 500 -> 500
+        q.insert("limit".to_string(), "500".to_string());
+        assert_eq!(parse_audit_query(&q), Ok((500, None)));
+
+        // 501 -> 500
+        q.insert("limit".to_string(), "501".to_string());
+        assert_eq!(parse_audit_query(&q), Ok((500, None)));
+
+        // 100000 -> 500
+        q.insert("limit".to_string(), "100000".to_string());
+        assert_eq!(parse_audit_query(&q), Ok((500, None)));
+
+        // 0, -1, abc -> error
+        q.insert("limit".to_string(), "0".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        q.insert("limit".to_string(), "-1".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        q.insert("limit".to_string(), "abc".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        // reset valid limit
+        q.insert("limit".to_string(), "20".to_string());
+
+        // before 0, -5, abc -> error
+        q.insert("before".to_string(), "0".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        q.insert("before".to_string(), "-5".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        q.insert("before".to_string(), "abc".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        // valid before passes through
+        q.insert("before".to_string(), "42".to_string());
+        assert_eq!(parse_audit_query(&q), Ok((20, Some(42))));
+    }
 }

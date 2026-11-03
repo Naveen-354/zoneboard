@@ -314,4 +314,31 @@ mod tests {
         let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
         assert_eq!(entries.len(), 0);
     }
+
+    #[test]
+    fn unchanged_values_write_nothing() {
+        let mut conn = setup_test_db();
+        let mut updates = serde_json::Map::new();
+        updates.insert("timezone".to_string(), json!("Asia/Kolkata"));
+
+        // First update: timezone changed from UTC to Asia/Kolkata -> 1 audit row
+        let updated = update_settings(&mut conn, &updates).unwrap();
+        assert_eq!(updated.timezone, "Asia/Kolkata");
+        let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "settings_update");
+
+        // Second update with same timezone -> unchanged, writes nothing, still exactly 1 settings_update row
+        let updated_again = update_settings(&mut conn, &updates).unwrap();
+        assert_eq!(updated_again.timezone, "Asia/Kolkata");
+        let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        // Third update with empty object {} -> writes nothing, still exactly 1 settings_update row
+        let empty = serde_json::Map::new();
+        let updated_empty = update_settings(&mut conn, &empty).unwrap();
+        assert_eq!(updated_empty.timezone, "Asia/Kolkata");
+        let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
 }
