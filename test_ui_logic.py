@@ -41,3 +41,108 @@ def test_nse_open_matches_the_session_hours():
     got = json.loads(res.stdout)
     for (t, want), g in zip(CASES, got):
         assert g is want, f"{t}: expected open={want}, got {g}"
+
+def run_node_eval(script: str) -> subprocess.CompletedProcess:
+    bootstrap = (
+        "globalThis.matchMedia = globalThis.matchMedia || (() => ({ matches: false }));\n"
+    )
+    return subprocess.run(
+        [NODE, "--input-type=module", "-e", bootstrap + script],
+        capture_output=True,
+        text=True,
+        cwd=HERE,
+        timeout=30,
+    )
+
+
+def test_api_sends_token_from_meta_and_preserves_custom_headers():
+    script = """
+    let capturedHeaders = null;
+    globalThis.document = {
+        querySelector: (sel) => (sel === 'meta[name="zb-token"]' ? { getAttribute: (attr) => (attr === 'content' ? 'abc' : null) } : null)
+    };
+    globalThis.fetch = async (url, opts) => {
+        capturedHeaders = Object.fromEntries(opts.headers.entries());
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+    const { api } = await import('./static/js/util.js');
+    const res = await api('/api/test', { headers: { 'Content-Type': 'application/json' } });
+    console.log(JSON.stringify({ res, headers: capturedHeaders }));
+    """
+    res = run_node_eval(script)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert out["headers"].get("x-zb-token") == "abc"
+    assert out["headers"].get("content-type") == "application/json"
+    assert out["res"] == {"ok": True}
+
+
+@pytest.mark.parametrize("meta_content", [None, ""])
+def test_api_omits_token_header_when_meta_missing_or_empty(meta_content):
+    meta_json = json.dumps(meta_content)
+    script = f"""
+    let capturedHeaders = null;
+    const metaVal = {meta_json};
+    globalThis.document = {{
+        querySelector: (sel) => (sel === 'meta[name="zb-token"]' && metaVal !== null
+            ? {{ getAttribute: (attr) => (attr === 'content' ? metaVal : null) }}
+            : null)
+    }};
+    globalThis.fetch = async (url, opts) => {{
+        capturedHeaders = Object.fromEntries(opts.headers.entries());
+        return new Response(JSON.stringify({{ ok: true }}), {{ status: 200 }});
+    }};
+    const {{ api }} = await import('./static/js/util.js');
+    await api('/api/test');
+    console.log(JSON.stringify({{ hasToken: 'x-zb-token' in capturedHeaders }}));
+    """
+    res = run_node_eval(script)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert out["hasToken"] is False
+
+
+def test_api_throws_reload_the_page_on_401():
+    script = """
+    globalThis.document = { querySelector: () => null };
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+    const { api } = await import('./static/js/util.js');
+    try {
+        await api('/api/test');
+        console.log(JSON.stringify({ threw: false }));
+    } catch (err) {
+        console.log(JSON.stringify({ threw: true, message: err.message }));
+    }
+    """
+    res = run_node_eval(script)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert out["threw"] is True
+    assert "reload the page" in out["message"]
+
+
+def test_api_non_401_error_and_200_json():
+    script = """
+    globalThis.document = { querySelector: () => null };
+    globalThis.fetch = async (url) => {
+        if (url === '/api/fail') {
+            return new Response(JSON.stringify({ error: "boom" }), { status: 400 });
+        }
+        return new Response(JSON.stringify({ ok: true, count: 42 }), { status: 200 });
+    };
+    const { api } = await import('./static/js/util.js');
+    let thrownError = null;
+    try {
+        await api('/api/fail');
+    } catch (err) {
+        thrownError = err.message;
+    }
+    const success = await api('/api/ok');
+    console.log(JSON.stringify({ thrownError, success }));
+    """
+    res = run_node_eval(script)
+    assert res.returncode == 0, res.stderr
+    out = json.loads(res.stdout)
+    assert out["thrownError"] == "boom"
+    assert out["success"] == {"ok": True, "count": 42}
+

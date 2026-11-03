@@ -33,6 +33,7 @@ axum = "0.8"
 chrono = "0.4.45"
 dirs = "7.0.0"
 futures-util = "0.3.34"
+rand = "0.8"
 reqwest = { version = "0.13.5", features = ["json", "gzip"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 rust-embed = "8.13.0"
@@ -40,6 +41,7 @@ rust_decimal = { version = "1.36", features = ["serde", "serde-with-str"] }
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
+subtle = "2"
 tauri = { version = "2", optional = true }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
 tracing = "0.1"

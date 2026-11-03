@@ -54,8 +54,26 @@ export function fmtCompact(n) {
 export const signed = (n, d = 2) => (n > 0 ? "+" : "") + fmt(n, d);
 
 /** fetch() that returns parsed JSON and turns {error} bodies into thrown Errors. */
-export async function api(path, opts) {
-  const r = await fetch(path, opts);
+let apiToken = null;
+
+function getApiToken() {
+  if (apiToken === null) {
+    const meta = typeof document !== "undefined" ? document.querySelector('meta[name="zb-token"]') : null;
+    apiToken = meta ? meta.getAttribute("content") || "" : "";
+  }
+  return apiToken;
+}
+
+export async function api(path, opts = {}) {
+  const token = getApiToken();
+  const headers = new Headers(opts.headers || {});
+  if (token && !headers.has("X-ZB-Token")) {
+    headers.set("X-ZB-Token", token);
+  }
+  const r = await fetch(path, { ...opts, headers });
+  if (r.status === 401) {
+    throw new Error("ZoneBoard was restarted or this page is stale: reload the page");
+  }
   let body = null;
   try {
     body = await r.json();
