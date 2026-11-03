@@ -1,7 +1,6 @@
 //! Trade journal on SQLite. Same table, same rules and same JSON as the Python app, so an existing
 //! `journal.db` opens as-is. Journals made before crypto existed get a `market` column (all NSE).
 
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use chrono::{FixedOffset, NaiveDate, Utc};
@@ -90,50 +89,29 @@ fn round(x: f64, d: i32) -> f64 {
 /// existing journal keeps working), else the user's data folder.
 pub fn default_path() -> String {
     if let Ok(p) = std::env::var("JOURNAL_DB") {
-        return p;
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            tracing::info!(path = %trimmed, source = "JOURNAL_DB", "resolved journal path");
+            return trimmed.to_string();
+        }
     }
     if let Ok(cwd) = std::env::current_dir() {
         let p = cwd.join("journal.db");
         if p.exists() {
-            return p.to_string_lossy().into_owned();
+            let s = p.to_string_lossy().into_owned();
+            tracing::info!(path = %s, source = "current_dir", "resolved journal path");
+            return s;
         }
     }
-    let dir: PathBuf = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("ZoneBoard");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("journal.db").to_string_lossy().into_owned()
+    let p = crate::db::data_dir().join("journal.db");
+    let s = p.to_string_lossy().into_owned();
+    tracing::info!(path = %s, source = "data_dir", "resolved journal path");
+    s
 }
 
 impl Journal {
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
-                qty REAL NOT NULL, entry REAL NOT NULL, exit REAL NOT NULL,
-                fees REAL NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '',
-                market TEXT NOT NULL DEFAULT 'india',
-                mode TEXT NOT NULL DEFAULT 'live'
-            );
-            CREATE TABLE IF NOT EXISTS positions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                market TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'live',
-                symbol TEXT NOT NULL, side TEXT NOT NULL,
-                qty REAL NOT NULL, entry REAL NOT NULL, fee_pct REAL NOT NULL, opened_at TEXT NOT NULL
-            );",
-        )?;
-        // Older journals: no market column (those trades were all NSE), no mode column (all live prices).
-        let cols: Vec<String> = conn.prepare("PRAGMA table_info(trades)")?.query_map([], |r| r.get::<_, String>(1))?.filter_map(Result::ok).collect();
-        if !cols.iter().any(|c| c == "market") {
-            conn.execute("ALTER TABLE trades ADD COLUMN market TEXT NOT NULL DEFAULT 'india'", [])?;
-        }
-        if !cols.iter().any(|c| c == "mode") {
-            conn.execute("ALTER TABLE trades ADD COLUMN mode TEXT NOT NULL DEFAULT 'live'", [])?;
-        }
-        // An earlier build recorded the order ticket's paper trades under "live" (meaning real prices). They were never
-        // real orders, so they belong to the demo account. Journal entries typed in by hand (any other note) stay live.
-        conn.execute("UPDATE trades SET mode = 'demo' WHERE mode = 'live' AND notes = 'Paper trade'", [])?;
-        conn.execute("UPDATE positions SET mode = 'demo' WHERE mode = 'live'", [])?;
+    pub fn open(path: &str) -> Result<Self, crate::db::DbError> {
+        let conn = crate::db::open(path)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 

@@ -334,7 +334,9 @@ pub async fn serve(listeners: Vec<TcpListener>, state: Shared) -> std::io::Resul
 pub fn spawn() -> Result<u16, String> {
     let listeners = bind().map_err(|e| format!("can't start the local server: {e}"))?;
     let port = port_of(&listeners);
-    let state = AppState::new(sample_from_env(), &journal::default_path())?;
+    let journal_path = journal::default_path();
+    tracing::info!(port, journal_path = %journal_path, version = env!("CARGO_PKG_VERSION"), "ZoneBoard server started");
+    let state = AppState::new(sample_from_env(), &journal_path)?;
     std::thread::Builder::new()
         .name("zoneboard-server".into())
         .spawn(move || {

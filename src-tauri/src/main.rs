@@ -5,6 +5,11 @@
 use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 fn main() {
+    let data_dir = zoneboard::db::ensure_data_dir().unwrap_or_else(|e| {
+        eprintln!("ZoneBoard: {e}");
+        std::process::exit(1);
+    });
+    zoneboard::logging::init(&data_dir);
     let port = zoneboard::server::spawn().unwrap_or_else(|e| {
         eprintln!("ZoneBoard: {e}");
         std::process::exit(1);
