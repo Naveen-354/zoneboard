@@ -6,7 +6,8 @@ A personal scanner, chart, journal and backtester for **live crypto** and **dela
 - **Chart:** candles, volume, order block zones, swing-high/low liquidity levels, support and resistance. The forming candle moves trade by trade.
 - **Paper trading:** an order ticket on the chart screen. Buy or sell at the price on screen, watch the position's P&L move, close it. **Simulated: no broker, no real money.**
 - **Journal:** every closed paper trade is logged automatically, per market, with net P&L, win rate, profit factor and fees paid.
-- **Live / Demo account toggle** (top right): **Demo** is the practice account (simulated orders on real prices). **Live** is the account for real orders, which isn't connected to any broker yet.
+- **Pages** (header): Board, Orders (placeholder until the execution core), **Accounts** (the practice account's VIRTUAL credits: edit, reset; Binance and FYERS show "Not connected"), Journal, and **Settings** (timezone, notification toggle, a read-only security summary, the audit log). Accounts and Settings load on first visit; the app remembers your last page.
+- **Live / Demo account toggle** (top right, with the active account's name): **Demo** is the practice account (simulated orders on real prices). **Live** is the account for real orders, which isn't connected to any broker yet.
 - **Backtest:** test the order block rule on years of history before trusting it.
 
 | Market | Data | Speed |
@@ -58,6 +59,25 @@ The toggle in the top right is about the **account**, not the data: **the charts
 | Journal | your paper trades | trades made through a connected broker (none) |
 
 Switching is instant and keeps both accounts' positions and journals separate. `?demo` or `?live` in the URL picks the account; otherwise the app remembers your last choice (Demo the first time).
+
+### Virtual accounts and funds
+
+The Demo account is a **practice account with virtual credits**: 10,000 USDT and 1,000,000 INR to start, both editable. **This app holds no money**; every balance the API returns carries `"virtual": true`, and real balances will come from your broker (or show "not connected").
+
+- An order must fit the available funds: `available = credits + realised P&L - notional of open positions` (shorts reserve their full notional too). An order above it is refused with `insufficient virtual funds: ...`. Fees are charged when a position closes, as before. NSE orders draw on the INR wallet and USDT-quoted crypto on the USDT wallet; other crypto quotes (for example `ETHBTC`) have no wallet yet and are refused.
+- Closing a position releases its funds and applies the P&L and fees. A bad run can take the balance **below zero**; it is shown as is (a loss is never hidden) and new orders are refused until you raise the credits or reset.
+- **Reset** removes the account's open positions (no trade is logged for them), sets every balance back to its credits and **keeps the trade history**. Deleting a trade from the Journal never changes the balance.
+- The fill price still comes from the page, so the funds check is practice bookkeeping, not a security boundary.
+- Every create, credit change and reset is written to the audit log in the same transaction.
+- **Upgrading from an earlier build:** the database moves to schema version 4 the first time it opens. The change is one transaction, but an older build refuses a version 4 file, so copy `journal.db` first (`copy journal.db journal.db.v3.bak`). Existing demo trades and positions are linked to the new `demo-1` account, and the paper trades already in the journal are replayed into its wallet. If your open positions already exceed the credits, new orders are blocked until you raise the credits or reset. Hand-entered live trades belong to no account.
+
+| Endpoint | Does |
+|---|---|
+| `GET /api/accounts` | every account with its wallets (`credits`, `balance`, `in_positions`, `available`, all decimal strings) |
+| `POST /api/accounts` | `{"kind":"demo","label":"...","credits":{"USDT":"500"}}` creates a demo account (at most 10; broker accounts arrive later) |
+| `PATCH /api/accounts/{id}` | `label` and `credits` only; any other field is a 400; changing credits keeps realised P&L |
+| `POST /api/accounts/{id}/reset` | as above |
+| `POST /api/positions` | accepts an optional `account_id` (default `demo-1`); `GET /api/positions` and `GET /api/journal` accept it too |
 
 ### Developing without internet (sample data)
 

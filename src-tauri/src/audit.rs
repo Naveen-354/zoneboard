@@ -175,8 +175,10 @@ mod tests {
         let id = record(&conn, "user", "login", "auth", &detail).unwrap();
         assert!(id > 0);
 
+        // a fresh database already holds migration 4's `account_created` row for demo-1
         let (entries, next_before) = list(&conn, 10, None).unwrap();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].action, "account_created");
         assert_eq!(next_before, None);
 
         let entry = &entries[0];
@@ -264,10 +266,11 @@ mod tests {
         assert_eq!(page2[1].action, "action_2");
         assert_eq!(next2, Some(page2[1].id));
 
-        // Page 3: limit 2, before 2 -> entry 1, next_before None
+        // Page 3: limit 2, before 2 -> entry 1 and migration 4's seed row (the oldest), next_before None
         let (page3, next3) = list(&conn, 2, next2).unwrap();
-        assert_eq!(page3.len(), 1);
+        assert_eq!(page3.len(), 2);
         assert_eq!(page3[0].action, "action_1");
+        assert_eq!(page3[1].action, "account_created");
         assert_eq!(next3, None);
     }
 }

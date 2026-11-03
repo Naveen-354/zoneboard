@@ -223,6 +223,9 @@ pub fn update_settings(
 mod tests {
     use super::*;
 
+    /// Audit rows every fresh database starts with: migration 4's `account_created` for demo-1.
+    const SEEDED: usize = 1;
+
     fn setup_test_db() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::db::migrate(&mut conn).unwrap();
@@ -252,7 +255,7 @@ mod tests {
 
         // Check audit log
         let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), SEEDED + 1);
         let entry = &entries[0];
         assert_eq!(entry.actor, "user");
         assert_eq!(entry.action, "settings_update");
@@ -277,7 +280,7 @@ mod tests {
 
         // No audit row written
         let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
-        assert_eq!(entries.len(), 0);
+        assert_eq!(entries.len(), SEEDED);
     }
 
     #[test]
@@ -293,7 +296,7 @@ mod tests {
 
         // No audit row written
         let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
-        assert_eq!(entries.len(), 0);
+        assert_eq!(entries.len(), SEEDED);
     }
 
     #[test]
@@ -312,7 +315,7 @@ mod tests {
 
         // No audit row written
         let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
-        assert_eq!(entries.len(), 0);
+        assert_eq!(entries.len(), SEEDED);
     }
 
     #[test]
@@ -325,20 +328,20 @@ mod tests {
         let updated = update_settings(&mut conn, &updates).unwrap();
         assert_eq!(updated.timezone, "Asia/Kolkata");
         let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), SEEDED + 1);
         assert_eq!(entries[0].action, "settings_update");
 
         // Second update with same timezone -> unchanged, writes nothing, still exactly 1 settings_update row
         let updated_again = update_settings(&mut conn, &updates).unwrap();
         assert_eq!(updated_again.timezone, "Asia/Kolkata");
         let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), SEEDED + 1);
 
         // Third update with empty object {} -> writes nothing, still exactly 1 settings_update row
         let empty = serde_json::Map::new();
         let updated_empty = update_settings(&mut conn, &empty).unwrap();
         assert_eq!(updated_empty.timezone, "Asia/Kolkata");
         let (entries, _) = crate::audit::list(&conn, 10, None).unwrap();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), SEEDED + 1);
     }
 }

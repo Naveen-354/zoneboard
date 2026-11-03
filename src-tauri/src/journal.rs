@@ -4,7 +4,7 @@
 use std::sync::Mutex;
 
 use chrono::{FixedOffset, NaiveDate, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -36,6 +36,8 @@ pub struct Trade {
     pub market: String,
     pub mode: String,
     pub pnl: f64,
+    /// The demo account this trade belongs to. `None` for hand-entered live trades.
+    pub account_id: Option<String>,
 }
 
 /// An open paper position. Closing it writes a [`Trade`] and removes it.
@@ -50,6 +52,7 @@ pub struct Position {
     pub entry: f64,
     pub fee_pct: f64,
     pub opened_at: String,
+    pub account_id: Option<String>,
 }
 
 /// Why a close failed: no such position, or the request itself was bad.
@@ -121,19 +124,31 @@ impl Journal {
         f(&mut conn)
     }
 
-    const TRADE_COLS: &'static str = "id, date, symbol, side, qty, entry, exit, fees, notes, market, mode";
+    const TRADE_COLS: &'static str = "id, date, symbol, side, qty, entry, exit, fees, notes, market, mode, account_id";
 
     fn trade_from_row(r: &rusqlite::Row) -> rusqlite::Result<Trade> {
         let (side, qty, entry, exit, fees): (String, f64, f64, f64, f64) = (r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?);
         let gross = (exit - entry) * qty * if side == "long" { 1.0 } else { -1.0 };
-        Ok(Trade { id: r.get(0)?, date: r.get(1)?, symbol: r.get(2)?, side, qty, entry, exit, fees, notes: r.get(8)?, market: r.get(9)?, mode: r.get(10)?, pnl: round(gross - fees, 2) })
+        Ok(Trade { id: r.get(0)?, date: r.get(1)?, symbol: r.get(2)?, side, qty, entry, exit, fees, notes: r.get(8)?, market: r.get(9)?, mode: r.get(10)?, pnl: round(gross - fees, 2), account_id: r.get(11)? })
+    }
+
+    /// Reads for the demo account with no account named mean the default demo account; live reads are unchanged.
+    fn account_filter(mode: &str, account: Option<&str>) -> Option<String> {
+        match account.map(str::trim).filter(|a| !a.is_empty()) {
+            Some(a) => Some(a.to_string()),
+            None => (mode == "demo").then(|| crate::accounts::DEFAULT_ACCOUNT.to_string()),
+        }
     }
 
     pub fn payload(&self, market: &str, mode: &str) -> Payload {
+        self.payload_for(market, mode, None)
+    }
+
+    pub fn payload_for(&self, market: &str, mode: &str, account: Option<&str>) -> Payload {
         let conn = self.conn.lock().unwrap();
-        let sql = format!("SELECT {} FROM trades WHERE market = ?1 AND mode = ?2 ORDER BY date DESC, id DESC", Self::TRADE_COLS);
+        let sql = format!("SELECT {} FROM trades WHERE market = ?1 AND mode = ?2 AND (?3 IS NULL OR account_id = ?3) ORDER BY date DESC, id DESC", Self::TRADE_COLS);
         let mut st = conn.prepare(&sql).unwrap();
-        let trades: Vec<Trade> = st.query_map([market, mode], Self::trade_from_row).unwrap().filter_map(Result::ok).collect();
+        let trades: Vec<Trade> = st.query_map(params![market, mode, Self::account_filter(mode, account)], Self::trade_from_row).unwrap().filter_map(Result::ok).collect();
         let stats = stats_of(&trades);
         Payload { trades, stats }
     }
@@ -196,20 +211,25 @@ impl Journal {
     // Orders are simulated: a market order fills at the price the page sends (the real price on screen).
     // Closing a position records it as a trade. No broker is involved and no real money moves.
 
-    const POSITION_COLS: &'static str = "id, market, mode, symbol, side, qty, entry, fee_pct, opened_at";
+    const POSITION_COLS: &'static str = "id, market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id";
 
     fn position_from_row(r: &rusqlite::Row) -> rusqlite::Result<Position> {
-        Ok(Position { id: r.get(0)?, market: r.get(1)?, mode: r.get(2)?, symbol: r.get(3)?, side: r.get(4)?, qty: r.get(5)?, entry: r.get(6)?, fee_pct: r.get(7)?, opened_at: r.get(8)? })
+        Ok(Position { id: r.get(0)?, market: r.get(1)?, mode: r.get(2)?, symbol: r.get(3)?, side: r.get(4)?, qty: r.get(5)?, entry: r.get(6)?, fee_pct: r.get(7)?, opened_at: r.get(8)?, account_id: r.get(9)? })
     }
 
     pub fn positions(&self, market: &str, mode: &str) -> Vec<Position> {
-        let conn = self.conn.lock().unwrap();
-        let sql = format!("SELECT {} FROM positions WHERE market = ?1 AND mode = ?2 ORDER BY id DESC", Self::POSITION_COLS);
-        let mut st = conn.prepare(&sql).unwrap();
-        st.query_map([market, mode], Self::position_from_row).unwrap().filter_map(Result::ok).collect()
+        self.positions_for(market, mode, None)
     }
 
-    /// Open a position from `{market, mode, symbol, side, qty, price}`. Fills at `price`.
+    pub fn positions_for(&self, market: &str, mode: &str, account: Option<&str>) -> Vec<Position> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!("SELECT {} FROM positions WHERE market = ?1 AND mode = ?2 AND (?3 IS NULL OR account_id = ?3) ORDER BY id DESC", Self::POSITION_COLS);
+        let mut st = conn.prepare(&sql).unwrap();
+        st.query_map(params![market, mode, Self::account_filter(mode, account)], Self::position_from_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Open a position from `{market, mode, symbol, side, qty, price, account_id?}`. Fills at `price`.
+    /// The order must fit the demo account's available virtual funds (`accounts::check_funds`).
     pub fn open_position(&self, body: &Value) -> Result<Position, String> {
         let bad = |m: &str| Err(format!("invalid order: {m}"));
         let text = |k: &str, d: &str| match body.get(k).and_then(Value::as_str).unwrap_or("") {
@@ -240,16 +260,27 @@ impl Journal {
         if market == "india" && qty.fract() != 0.0 {
             return bad("NSE quantity must be a whole number");
         }
+        let account = match body.get("account_id") {
+            None | Some(Value::Null) => crate::accounts::DEFAULT_ACCOUNT,
+            Some(Value::String(a)) if !a.trim().is_empty() => a.trim(),
+            Some(_) => return bad("account_id must be text"),
+        };
         let opened = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![market, mode, symbol, side, qty, price, fee_pct(&market), opened],
+        let mut conn = self.conn.lock().unwrap();
+        // IMMEDIATE: the funds check and the insert are one unit even if a second connection writes meanwhile.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        crate::accounts::require_demo(&tx, account)?;
+        crate::accounts::check_funds(&tx, account, &market, &symbol, qty, price)?;
+        tx.execute(
+            "INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![market, mode, symbol, side, qty, price, fee_pct(&market), opened, account],
         )
         .map_err(|e| e.to_string())?;
-        let id = conn.last_insert_rowid();
+        let id = tx.last_insert_rowid();
         let sql = format!("SELECT {} FROM positions WHERE id = ?1", Self::POSITION_COLS);
-        conn.query_row(&sql, [id], Self::position_from_row).map_err(|e| e.to_string())
+        let position = tx.query_row(&sql, [id], Self::position_from_row).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(position)
     }
 
     /// Close position `id` at `body.price` (optionally `body.date`, YYYY-MM-DD). Records the trade, removes the
@@ -275,13 +306,23 @@ impl Journal {
             Utc::now().with_timezone(&tz).format("%Y-%m-%d").to_string()
         });
         let fees = pos.fee_pct / 100.0 * pos.qty * (pos.entry + price); // both sides, at their own prices
+        // Exact P&L for the wallet. Computed before anything is written so an overflow (a silly close price)
+        // is a clean 400 and leaves the position open.
+        let net = crate::accounts::realised(&pos.side, pos.qty, pos.entry, price, fees).ok_or_else(|| invalid("price is too large".into()))?;
         tx.execute(
-            "INSERT INTO trades (date, symbol, side, qty, entry, exit, fees, notes, market, mode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![day, pos.symbol, pos.side, pos.qty, pos.entry, price, fees, "Paper trade", pos.market, pos.mode],
+            "INSERT INTO trades (date, symbol, side, qty, entry, exit, fees, notes, market, mode, account_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![day, pos.symbol, pos.side, pos.qty, pos.entry, price, fees, "Paper trade", pos.market, pos.mode, pos.account_id],
         )
         .map_err(db)?;
         let trade_id = tx.last_insert_rowid();
         tx.execute("DELETE FROM positions WHERE id = ?1", [id]).map_err(db)?;
+        // Release the funds and apply the P&L in the same transaction as the trade and the delete.
+        if let Some(account) = &pos.account_id {
+            match crate::accounts::currency_for(&pos.market, &pos.symbol) {
+                Ok(currency) => crate::accounts::apply_pnl(&tx, account, currency, net).map_err(CloseError::Invalid)?,
+                Err(e) => tracing::warn!(account = %account, "closed position has no virtual wallet: {e}"),
+            }
+        }
         let sql = format!("SELECT {} FROM trades WHERE id = ?1", Self::TRADE_COLS);
         let trade = tx.query_row(&sql, [trade_id], Self::trade_from_row).map_err(db)?;
         tx.commit().map_err(db)?;

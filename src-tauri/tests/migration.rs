@@ -224,7 +224,7 @@ fn data_dir_resolution_does_not_create_directory() {
 }
 
 #[test]
-fn fixture_v2_migrates_to_v3_with_data_intact() {
+fn fixture_v2_migrates_to_latest_with_data_intact() {
     let db_path = create_from_fixture("legacy_v0_paper_live.sql");
     let path_str = db_path.to_str().unwrap();
 
@@ -249,7 +249,7 @@ fn fixture_v2_migrates_to_v3_with_data_intact() {
     db::migrate(&mut conn).unwrap();
 
     assert_eq!(db::user_version(&conn).unwrap(), CURRENT_VERSION);
-    assert_eq!(db::user_version(&conn).unwrap(), 3);
+    assert_eq!(db::user_version(&conn).unwrap(), 4);
 
     // Verify data is completely intact
     let trade_count_v3: i64 = conn.query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0)).unwrap();
@@ -266,21 +266,132 @@ fn fixture_v2_migrates_to_v3_with_data_intact() {
     assert_eq!(btc_mode, "demo");
 
     // Verify audit_log and settings tables and triggers are active
+    // exactly one row: migration 4's `account_created` for demo-1 (nothing else has written yet)
     let audit_count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0)).unwrap();
-    assert_eq!(audit_count, 0);
+    assert_eq!(audit_count, 1);
+    let first: String = conn.query_row("SELECT action FROM audit_log", [], |r| r.get(0)).unwrap();
+    assert_eq!(first, "account_created");
 
     let settings_count: i64 = conn.query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0)).unwrap();
     assert_eq!(settings_count, 0);
 
-    // Insert into audit_log and verify append-only trigger works
+    // Insert into audit_log and verify append-only trigger works (id 1 is migration 4's seed row)
     conn.execute(
         "INSERT INTO audit_log (id, ts_utc, actor, action, entity, detail_json)
-         VALUES (1, '2026-11-03T00:00:00Z', 'system', 'test', 'system', '{}')",
+         VALUES (2, '2026-11-03T00:00:00Z', 'system', 'test', 'system', '{}')",
         [],
     ).unwrap();
-    let res = conn.execute("UPDATE audit_log SET actor = 'bad' WHERE id = 1", []);
+    let res = conn.execute("UPDATE audit_log SET actor = 'bad' WHERE id = 2", []);
     assert!(res.is_err(), "UPDATE on audit_log must be blocked by trigger");
+    // the seed row cannot be replaced either
+    let res = conn.execute(
+        "INSERT INTO audit_log (id, ts_utc, actor, action, entity, detail_json) VALUES (1, 'x', 'bad', 'bad', 'bad', '{}')",
+        [],
+    );
+    assert!(res.is_err(), "the seed audit row must not be replaceable");
 
     drop(conn);
     let _ = fs::remove_file(&db_path);
+}
+
+
+// ------------------------------------------------------------------ migration 4: accounts (T005)
+
+fn q<T: rusqlite::types::FromSql>(c: &Connection, sql: &str) -> T {
+    c.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn migration_4_on_a_populated_v3_database_links_demo_rows_and_seeds_the_wallet() {
+    let path = create_from_fixture("legacy_v3_demo.sql");
+    let mut c = Connection::open(&path).unwrap();
+    assert_eq!(db::user_version(&c).unwrap(), 3);
+    db::migrate(&mut c).unwrap(); // would fail here if account_id were NOT NULL DEFAULT ... REFERENCES
+
+    assert_eq!(db::user_version(&c).unwrap(), 4);
+    // demo rows are linked to demo-1, the live ones belong to no account
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM trades WHERE mode = 'demo' AND account_id = 'demo-1'"), 4);
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM trades WHERE mode = 'demo'"), 4);
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM trades WHERE mode = 'live' AND account_id IS NULL"), 1);
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM positions WHERE account_id = 'demo-1'"), 2);
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM trades"), 5, "no trade lost");
+
+    // wallets: only the two paper-engine trades moved USDT (8.5 + 98.43); hand-entered ones and INR did not
+    let wallet = |cur: &str, col: &str| -> String { c.query_row(&format!("SELECT {col} FROM demo_wallets WHERE account_id = 'demo-1' AND currency = ?1"), [cur], |r| r.get(0)).unwrap() };
+    assert_eq!((wallet("USDT", "credits"), wallet("USDT", "balance")), ("10000".to_string(), "10106.93".to_string()));
+    assert_eq!((wallet("INR", "credits"), wallet("INR", "balance")), ("1000000".to_string(), "1000000".to_string()));
+
+    // through the journal: reserved and available are exact
+    let j = Journal::open(path.to_str().unwrap()).unwrap();
+    let accounts = j.with_conn(|c| zoneboard::accounts::list(c)).unwrap();
+    let a = &accounts["accounts"][0];
+    let w = |cur: &str| a["wallets"].as_array().unwrap().iter().find(|w| w["currency"] == cur).unwrap().clone();
+    assert_eq!((w("USDT")["in_positions"].as_str(), w("USDT")["available"].as_str()), (Some("2000"), Some("8106.93")));
+    assert_eq!((w("INR")["in_positions"].as_str(), w("INR")["available"].as_str()), (Some("5000"), Some("995000")));
+    assert_eq!(a["virtual"], true);
+    assert_eq!(j.payload("crypto", "demo").trades.len(), 3);
+    assert_eq!(j.positions("crypto", "demo").len(), 1);
+
+    // exactly one audit row, by `system`, with the seed numbers
+    let (n, actor, action, entity, detail): (i64, String, String, String, String) =
+        c.query_row("SELECT count(*), actor, action, entity, detail_json FROM audit_log", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap();
+    assert_eq!((n, actor.as_str(), action.as_str(), entity.as_str()), (1, "system", "account_created", "account:demo-1"));
+    let d: serde_json::Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!((d["linked_trades"].as_i64(), d["linked_positions"].as_i64(), d["skipped_trades"].as_i64()), (Some(4), Some(2), Some(0)));
+    assert_eq!(d["seeded_realised"]["USDT"], "106.93");
+    assert_eq!(d["credits"]["USDT"], "10000");
+    drop(c);
+    drop(j);
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn migration_4_on_a_fresh_database_creates_demo_1_with_default_credits() {
+    let c = db::open(":memory:").unwrap();
+    assert_eq!(db::user_version(&c).unwrap(), 4);
+    let (id, kind, label, env, status, archived): (String, String, String, String, String, i64) =
+        c.query_row("SELECT id, kind, label, environment, status, archived FROM accounts", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap();
+    assert_eq!((id.as_str(), kind.as_str(), label.as_str(), env.as_str(), status.as_str(), archived), ("demo-1", "demo", "Demo", "paper", "active", 0));
+    assert_eq!(q::<String>(&c, "SELECT credits || '/' || balance FROM demo_wallets WHERE currency = 'USDT'"), "10000/10000");
+    assert_eq!(q::<String>(&c, "SELECT credits || '/' || balance FROM demo_wallets WHERE currency = 'INR'"), "1000000/1000000");
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM audit_log WHERE action = 'account_created'"), 1);
+}
+
+#[test]
+fn migration_4_runs_once() {
+    let path = create_from_fixture("legacy_v3_demo.sql");
+    for _ in 0..3 {
+        let mut c = Connection::open(&path).unwrap();
+        db::migrate(&mut c).unwrap();
+    }
+    let c = Connection::open(&path).unwrap();
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM accounts"), 1);
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM audit_log"), 1);
+    assert_eq!(q::<String>(&c, "SELECT balance FROM demo_wallets WHERE currency = 'USDT'"), "10106.93", "a re-open must not replay the seed");
+    drop(c);
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn legacy_writers_that_add_demo_rows_without_an_account_still_get_demo_1() {
+    let c = db::open(":memory:").unwrap();
+    c.execute("INSERT INTO trades (date, symbol, side, qty, entry, exit, fees, notes, market, mode) VALUES ('2026-11-02','BTCUSDT','long',1,1,2,0,'','crypto','demo')", []).unwrap();
+    c.execute("INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at) VALUES ('crypto','demo','BTCUSDT','long',1,1,0.1,'x')", []).unwrap();
+    assert_eq!(q::<String>(&c, "SELECT account_id FROM trades"), "demo-1");
+    assert_eq!(q::<String>(&c, "SELECT account_id FROM positions"), "demo-1");
+    // live rows stay unlinked: the trigger only covers mode = 'demo'
+    c.execute("INSERT INTO trades (date, symbol, side, qty, entry, exit, fees, notes, market, mode) VALUES ('2026-11-02','SBIN','long',1,1,2,0,'','india','live')", []).unwrap();
+    c.execute("INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at) VALUES ('india','live','SBIN','long',1,1,0.05,'x')", []).unwrap();
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM trades WHERE account_id IS NULL"), 1);
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM positions WHERE account_id IS NULL"), 1);
+}
+
+#[test]
+fn foreign_keys_are_enforced_and_schema_checks_hold() {
+    let c = db::open(":memory:").unwrap();
+    let bad = c.execute("INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id) VALUES ('crypto','demo','BTCUSDT','long',1,1,0.1,'x','nope')", []);
+    assert!(bad.is_err(), "a position for a missing account must be refused by the database");
+    assert!(c.execute("INSERT INTO demo_wallets (account_id, currency, credits, balance) VALUES ('nope','USDT','1','1')", []).is_err());
+    assert!(c.execute("INSERT INTO accounts (id, kind, label, environment, created_utc) VALUES ('x','demo','x','live','now')", []).is_err(), "a demo account is always paper");
+    assert!(c.execute("INSERT INTO accounts (id, kind, label, environment, created_utc) VALUES ('x','kraken','x','paper','now')", []).is_err());
 }
