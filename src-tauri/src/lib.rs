@@ -3,6 +3,9 @@
 
 pub mod backtest;
 pub mod data;
+pub mod db;
 pub mod journal;
+pub mod logging;
+pub mod money;
 pub mod server;
 pub mod zones;
