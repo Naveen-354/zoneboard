@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 /// The latest schema version supported by this application.
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
 
 /// Database error type covering schema version mismatches, SQLite errors, and IO issues.
 #[derive(Debug)]
@@ -198,6 +198,60 @@ pub fn migrate(conn: &mut Connection) -> Result<(), DbError> {
 
             PRAGMA user_version = 3;",
         )?;
+        tx.commit()?;
+        ver = 3;
+    }
+
+    if ver < 4 {
+        let tx = conn.transaction()?;
+        // Migration 4: accounts and the virtual demo wallets (T005).
+        // `account_id` is added NULLABLE on purpose: SQLite refuses `ADD COLUMN ... REFERENCES ... NOT NULL
+        // DEFAULT` on a table that already has rows, which would pass on an empty test database and fail on
+        // a real journal. Legacy `mode = 'live'` rows (hand-entered real trades) keep NULL: they belong to no
+        // account until a broker account exists.
+        tx.execute_batch(
+            "CREATE TABLE accounts (
+                id          TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 40),
+                kind        TEXT NOT NULL CHECK (kind IN ('demo','binance','fyers')),
+                label       TEXT NOT NULL CHECK (length(label) BETWEEN 1 AND 60),
+                environment TEXT NOT NULL CHECK (environment IN ('paper','testnet','live')),
+                status      TEXT NOT NULL DEFAULT 'active',
+                created_utc TEXT NOT NULL,
+                archived    INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)),
+                CHECK (kind <> 'demo' OR environment = 'paper')
+            );
+            CREATE TABLE demo_wallets (
+                account_id TEXT NOT NULL REFERENCES accounts(id),
+                currency   TEXT NOT NULL CHECK (currency IN ('USDT','INR')),
+                credits    TEXT NOT NULL,
+                balance    TEXT NOT NULL,
+                PRIMARY KEY (account_id, currency)
+            );",
+        )?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        tx.execute(
+            "INSERT INTO accounts (id, kind, label, environment, status, created_utc, archived) VALUES ('demo-1','demo','Demo','paper','active',?1,0)",
+            [now],
+        )?;
+        tx.execute_batch(
+            "INSERT INTO demo_wallets (account_id, currency, credits, balance) VALUES
+                ('demo-1','USDT','10000','10000'), ('demo-1','INR','1000000','1000000');
+            ALTER TABLE positions ADD COLUMN account_id TEXT REFERENCES accounts(id);
+            ALTER TABLE trades ADD COLUMN account_id TEXT REFERENCES accounts(id);
+            UPDATE positions SET account_id = 'demo-1' WHERE mode = 'demo';
+            UPDATE trades SET account_id = 'demo-1' WHERE mode = 'demo';
+            CREATE INDEX idx_positions_account ON positions(account_id);
+            CREATE INDEX idx_trades_account ON trades(account_id);
+            -- safety net for legacy writers (the frozen Python app, an old script) that add demo rows with no account
+            CREATE TRIGGER positions_demo_default_account AFTER INSERT ON positions
+              WHEN NEW.mode = 'demo' AND NEW.account_id IS NULL
+              BEGIN UPDATE positions SET account_id = 'demo-1' WHERE id = NEW.id; END;
+            CREATE TRIGGER trades_demo_default_account AFTER INSERT ON trades
+              WHEN NEW.mode = 'demo' AND NEW.account_id IS NULL
+              BEGIN UPDATE trades SET account_id = 'demo-1' WHERE id = NEW.id; END;",
+        )?;
+        crate::accounts::seed_from_legacy(&tx)?;
+        tx.execute_batch("PRAGMA user_version = 4;")?;
         tx.commit()?;
     }
 

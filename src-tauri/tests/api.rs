@@ -310,6 +310,10 @@ const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/api/audit", "/api/audit?limit=5", None),
     ("GET", "/api/settings", "/api/settings", None),
     ("PUT", "/api/settings", "/api/settings", Some(r#"{"timezone":"UTC"}"#)),
+    ("GET", "/api/accounts", "/api/accounts", None),
+    ("POST", "/api/accounts", "/api/accounts", Some(r#"{"kind":"demo","label":"Second"}"#)),
+    ("PATCH", "/api/accounts/{id}", "/api/accounts/demo-1", Some(r#"{"label":"Renamed"}"#)),
+    ("POST", "/api/accounts/{id}/reset", "/api/accounts/demo-1/reset", None),
 ];
 
 #[tokio::test]
@@ -399,6 +403,12 @@ async fn csrf_cross_origin_rejected_on_state_changing_methods() {
     assert_eq!(s, StatusCode::FORBIDDEN);
 
     let (s, _, _) = call(&app, "POST", "/api/positions", "localhost:5000", Some(order(json!({}))), &[("Origin", "null")]).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // PATCH and reset on accounts with a foreign Origin -> 403, and nothing changes
+    let (s, _, _) = call(&app, "PATCH", "/api/accounts/demo-1", "localhost:5000", Some(json!({"label":"x"})), &[("Origin", "https://evil.example.com")]).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = call(&app, "POST", "/api/accounts/demo-1/reset", "localhost:5000", None, &[("Origin", "https://evil.example.com")]).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 
     // DELETE on journal with foreign Origin -> 403
@@ -496,10 +506,13 @@ async fn audit_log_records_app_start_and_paginates_with_cursor() {
     let (s, res) = get_json(&r, "/api/audit").await;
     assert_eq!(s, StatusCode::OK);
     let entries = res["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 1);
+    // newest first: app_start, then migration 4's account_created for the default demo account
+    assert_eq!(entries.len(), 2);
     assert_eq!(entries[0]["action"], "app_start");
     assert_eq!(entries[0]["actor"], "system");
     assert_eq!(entries[0]["entity"], "system");
+    assert_eq!(entries[1]["action"], "account_created");
+    assert_eq!(entries[1]["entity"], "account:demo-1");
     assert_eq!(res["next_before"], Value::Null);
 
     // Query validation tests: invalid limits and cursors return 400 JSON
@@ -515,7 +528,7 @@ async fn audit_log_records_app_start_and_paginates_with_cursor() {
         assert_eq!(st, StatusCode::OK);
     }
 
-    // Total audit entries: 1 app_start + 3 settings_update = 4 entries
+    // Total audit entries: 1 account_created + 1 app_start + 3 settings_update = 5 entries
     let (s, res) = get_json(&r, "/api/audit?limit=2").await;
     assert_eq!(s, StatusCode::OK);
     let page1 = res["entries"].as_array().unwrap();
@@ -528,7 +541,12 @@ async fn audit_log_records_app_start_and_paginates_with_cursor() {
     assert_eq!(s, StatusCode::OK);
     let page2 = res["entries"].as_array().unwrap();
     assert_eq!(page2.len(), 2);
-    // When exactly 4 items and limit=2, next_before is None because no items remain after page 2
+    let next_cursor = res["next_before"].as_i64().unwrap();
+
+    // Page 3: the one remaining entry, then no cursor
+    let (s, res) = get_json(&r, &format!("/api/audit?limit=2&before={next_cursor}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(res["entries"].as_array().unwrap().len(), 1);
     assert_eq!(res["next_before"], Value::Null);
 }
 
@@ -649,4 +667,331 @@ async fn settings_unchanged_values_write_nothing() {
     let entries = audit["entries"].as_array().unwrap();
     let updates_count = entries.iter().filter(|e| e["action"] == "settings_update").count();
     assert_eq!(updates_count, 1);
+}
+
+
+// ------------------------------------------------------------------ accounts and virtual funds (T005)
+
+async fn api(app: &TestApp, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let (s, _, b) = call(app, method, uri, "localhost", body, &[]).await;
+    (s, serde_json::from_slice(&b).unwrap_or(Value::Null))
+}
+
+/// Audit actions, newest first.
+async fn audit_actions(app: &TestApp) -> Vec<String> {
+    let (_, v) = api(app, "GET", "/api/audit?limit=500", None).await;
+    v["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap().to_string()).collect()
+}
+
+fn wallet<'a>(account: &'a Value, cur: &str) -> &'a Value {
+    account["wallets"].as_array().unwrap().iter().find(|w| w["currency"] == cur).unwrap()
+}
+
+/// Every object that carries a balance or credits also says it is virtual, and money is always a string.
+fn assert_virtual(v: &Value) {
+    match v {
+        Value::Object(m) => {
+            if m.contains_key("balance") || m.contains_key("credits") {
+                assert_eq!(m.get("virtual"), Some(&Value::Bool(true)), "money object without virtual:true: {v}");
+                for k in ["balance", "credits", "in_positions", "available"] {
+                    if let Some(x) = m.get(k) {
+                        assert!(x.is_string(), "{k} must be a decimal string: {v}");
+                    }
+                }
+            }
+            m.values().for_each(assert_virtual);
+        }
+        Value::Array(a) => a.iter().for_each(assert_virtual),
+        _ => {}
+    }
+}
+
+fn buy(symbol: &str, qty: f64, price: f64, side: &str) -> Value {
+    order(json!({"symbol": symbol, "qty": qty, "price": price, "side": side}))
+}
+
+#[tokio::test]
+async fn fresh_database_has_demo_1_with_virtual_credits() {
+    let app = router();
+    let (s, v) = api(&app, "GET", "/api/accounts", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_virtual(&v);
+    assert_eq!(v["notice"], "Virtual practice credits. This app holds no money.");
+    let accounts = v["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 1);
+    let a = &accounts[0];
+    assert_eq!((a["id"].as_str(), a["kind"].as_str(), a["label"].as_str(), a["environment"].as_str()), (Some("demo-1"), Some("demo"), Some("Demo"), Some("paper")));
+    assert_eq!(a["virtual"], true);
+    let (usdt, inr) = (wallet(a, "USDT"), wallet(a, "INR"));
+    assert_eq!((usdt["credits"].as_str(), usdt["balance"].as_str(), usdt["available"].as_str()), (Some("10000"), Some("10000"), Some("10000")));
+    assert_eq!((inr["credits"].as_str(), inr["available"].as_str()), (Some("1000000"), Some("1000000")));
+    assert_eq!(audit_actions(&app).await.iter().filter(|a| *a == "account_created").count(), 1);
+}
+
+#[tokio::test]
+async fn orders_are_checked_against_virtual_funds_and_closing_releases_them() {
+    let app = router();
+    // F1: 780 USDT on 10000 is fine and is reserved
+    let (s, _) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 0.01, 78000.0, "long"))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (_, v) = api(&app, "GET", "/api/accounts", None).await;
+    let usdt = wallet(&v["accounts"][0], "USDT").clone();
+    assert_eq!((usdt["in_positions"].as_str(), usdt["available"].as_str(), usdt["balance"].as_str()), (Some("780"), Some("9220"), Some("10000")));
+    assert_eq!(v["accounts"][0]["open_positions"], 1);
+
+    // F2: exactly the available amount is accepted, one smallest unit more is rejected and inserts nothing
+    let (s, _) = api(&app, "POST", "/api/positions", Some(buy("ETHUSDT", 9220.0, 1.0, "long"))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, e) = api(&app, "POST", "/api/positions", Some(buy("ETHUSDT", 0.00000001, 1.0, "long"))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().starts_with("insufficient virtual funds: this order needs 0.00000001 USDT but only 0 USDT of virtual credit"), "{e}");
+    let (_, p) = api(&app, "GET", "/api/positions?market=crypto&mode=demo", None).await;
+    assert_eq!(p["positions"].as_array().unwrap().len(), 2);
+
+    // INR is a separate wallet: an NSE order is unaffected by a full USDT wallet
+    let (s, _) = api(&app, "POST", "/api/positions", Some(order(json!({"market":"india","symbol":"SBIN","qty":10,"price":500})))).await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // F5: close the BTC position at a profit: P&L less fees lands in the wallet exactly
+    let id = p["positions"].as_array().unwrap().iter().find(|x| x["symbol"] == "BTCUSDT").unwrap()["id"].as_i64().unwrap();
+    let (s, c) = api(&app, "POST", &format!("/api/positions/{id}/close"), Some(json!({"price": 79000}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(c["trade"]["account_id"], "demo-1");
+    let fees = 0.1 / 100.0 * 0.01 * (78000.0 + 79000.0); // 1.57, the unchanged fee formula
+    let (_, v) = api(&app, "GET", "/api/accounts", None).await;
+    let usdt = wallet(&v["accounts"][0], "USDT");
+    let balance: f64 = usdt["balance"].as_str().unwrap().parse().unwrap();
+    assert!((balance - (10000.0 + 10.0 - fees)).abs() < 1e-9, "{usdt}");
+    assert!((c["trade"]["pnl"].as_f64().unwrap() - (10.0 - fees)).abs() < 0.005);
+    assert_eq!(usdt["in_positions"], "9220"); // the 780 was released, the ETH position is still reserved
+}
+
+#[tokio::test]
+async fn a_short_reserves_its_full_notional() {
+    let app = router();
+    assert_eq!(api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 1.0, 6000.0, "short"))).await.0, StatusCode::CREATED);
+    let (s, e) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 1.0, 5000.0, "long"))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().contains("virtual"), "{e}");
+}
+
+#[tokio::test]
+async fn a_losing_short_can_take_the_balance_negative_and_blocks_new_orders() {
+    let app = router();
+    let (_, p) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 1.0, 100.0, "short"))).await;
+    let id = p["position"]["id"].as_i64().unwrap();
+    let (s, _) = api(&app, "POST", &format!("/api/positions/{id}/close"), Some(json!({"price": 20000}))).await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, v) = api(&app, "GET", "/api/accounts", None).await;
+    let usdt = wallet(&v["accounts"][0], "USDT");
+    assert!(usdt["balance"].as_str().unwrap().starts_with('-'), "a loss is shown, not hidden: {usdt}");
+    assert!(usdt["available"].as_str().unwrap().starts_with('-'));
+    assert_eq!(api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 0.0001, 100.0, "long"))).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn unknown_crypto_quote_and_overflow_are_clean_400s_and_the_server_survives() {
+    let app = router();
+    let (s, e) = api(&app, "POST", "/api/positions", Some(buy("ETHBTC", 1.0, 1.0, "long"))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().starts_with("no virtual wallet for ETHBTC"), "{e}");
+    // an order above the 1e15 limit is refused for that reason, not merely as "insufficient funds"
+    let (s, e) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 1e10, 1e6, "long"))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().contains("above the 1000000000000000 limit"), "{e}");
+    // F9: 1e20 * 1e20 overflows Decimal; must be a 400, not a panic that poisons the journal mutex
+    let (s, _) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 1e20, 1e20, "long"))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 1e300, 1.0, "long"))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 0.01, 78000.0, "long"))).await;
+    assert_eq!(s, StatusCode::CREATED, "the next request must still succeed");
+    // a silly close price is a 400 too and leaves the position open
+    let (_, p) = api(&app, "GET", "/api/positions?market=crypto&mode=demo", None).await;
+    let id = p["positions"][0]["id"].as_i64().unwrap();
+    assert_eq!(api(&app, "POST", &format!("/api/positions/{id}/close"), Some(json!({"price": 1e300}))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(api(&app, "GET", "/api/positions?market=crypto&mode=demo", None).await.1["positions"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn orders_name_their_account_and_live_is_still_refused_first() {
+    let app = router();
+    let (s, e) = api(&app, "POST", "/api/positions", Some(order(json!({"account_id": "nope"})))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(e["error"], "invalid order: unknown or archived demo account");
+    assert_eq!(api(&app, "POST", "/api/positions", Some(order(json!({"account_id": 7})))).await.0, StatusCode::BAD_REQUEST);
+    // A8: a live order is refused with the existing message before any account lookup
+    let (s, e) = api(&app, "POST", "/api/positions", Some(order(json!({"mode": "live", "account_id": "nope"})))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().contains("live orders aren't supported"), "{e}");
+
+    // reads default to demo-1 and can name an account
+    let (_, second) = api(&app, "POST", "/api/accounts", Some(json!({"label": "Second"}))).await;
+    assert_eq!(second["id"], "demo-2");
+    assert_eq!(api(&app, "POST", "/api/positions", Some(order(json!({"account_id": "demo-2"})))).await.0, StatusCode::CREATED);
+    let count = |v: &Value| v["positions"].as_array().unwrap().len();
+    assert_eq!(count(&api(&app, "GET", "/api/positions?market=crypto&mode=demo", None).await.1), 0);
+    assert_eq!(count(&api(&app, "GET", "/api/positions?market=crypto&mode=demo&account_id=demo-2", None).await.1), 1);
+    // F7: demo-2 funds are independent of demo-1
+    let (_, v) = api(&app, "GET", "/api/accounts", None).await;
+    assert_eq!(wallet(&v["accounts"][0], "USDT")["available"], "10000");
+    assert_eq!(wallet(&v["accounts"][1], "USDT")["available"], "9220");
+}
+
+#[tokio::test]
+async fn create_validates_everything_and_audits_once() {
+    let app = router();
+    let bad = |body: Value| {
+        let app = &app;
+        async move { api(app, "POST", "/api/accounts", Some(body)).await }
+    };
+    for body in [
+        json!({"kind": "binance", "label": "x"}),
+        json!({"kind": "fyers", "label": "x"}),
+        json!({"kind": "demo", "label": "x", "environment": "live"}),
+        json!({"label": ""}),
+        json!({"label": "x".repeat(61)}),
+        json!({"label": "ok", "credits": {"USDT": -1}}),
+        json!({"label": "ok", "credits": {"USDT": "abc"}}),
+        json!({"label": "ok", "credits": {"USDT": 1e40}}),
+        json!({"label": "ok", "credits": {"USDT": "0.123456789"}}),
+        json!({"label": "ok", "credits": {"INR": "1.001"}}),
+        json!({"label": "ok", "credits": {"BTC": 1}}),
+        json!({"label": "ok", "balance": "999999"}),
+        json!([1, 2]),
+    ] {
+        let (s, e) = bad(body.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        assert!(e["error"].is_string());
+    }
+    let (_, v) = api(&app, "GET", "/api/accounts", None).await;
+    assert_eq!(v["accounts"].as_array().unwrap().len(), 1, "no failed request may create anything");
+    assert_eq!(audit_actions(&app).await.iter().filter(|a| *a == "account_created").count(), 1);
+
+    // success: defaults, 201, exactly one audit row, credits in clear in the detail
+    let (s, a) = api(&app, "POST", "/api/accounts", Some(json!({"kind": "demo", "label": "Scalping", "credits": {"USDT": "500"}}))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_virtual(&a);
+    assert_eq!((a["id"].as_str(), wallet(&a, "USDT")["credits"].as_str(), wallet(&a, "INR")["credits"].as_str()), (Some("demo-2"), Some("500"), Some("1000000")));
+    assert_eq!(audit_actions(&app).await.iter().filter(|a| *a == "account_created").count(), 2);
+    let (_, log) = api(&app, "GET", "/api/audit?limit=1", None).await;
+    assert_eq!(log["entries"][0]["detail"]["credits"]["USDT"], "500");
+
+    // the cap: 10 demo accounts in total
+    for i in 3..=10 {
+        assert_eq!(api(&app, "POST", "/api/accounts", Some(json!({"label": format!("a{i}")}))).await.0, StatusCode::CREATED);
+    }
+    assert_eq!(api(&app, "POST", "/api/accounts", Some(json!({"label": "eleventh"}))).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn patch_changes_label_and_credits_keeps_pnl_and_audits_only_real_changes() {
+    let app = router();
+    // realise a P&L first, so the shift can be told apart from a reset
+    let (_, p) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 1.0, 100.0, "long"))).await;
+    let id = p["position"]["id"].as_i64().unwrap();
+    api(&app, "POST", &format!("/api/positions/{id}/close"), Some(json!({"price": 110}))).await;
+    let (_, before) = api(&app, "GET", "/api/accounts", None).await;
+    let bal0: f64 = wallet(&before["accounts"][0], "USDT")["balance"].as_str().unwrap().parse().unwrap();
+
+    let n0 = audit_actions(&app).await.len();
+    let (s, a) = api(&app, "PATCH", "/api/accounts/demo-1", Some(json!({"credits": {"USDT": "12000"}}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_virtual(&a);
+    let usdt = wallet(&a, "USDT");
+    assert_eq!(usdt["credits"], "12000");
+    let bal1: f64 = usdt["balance"].as_str().unwrap().parse().unwrap();
+    assert!((bal1 - (bal0 + 2000.0)).abs() < 1e-9, "balance must shift by the credit delta: {bal0} -> {bal1}");
+    assert_eq!(audit_actions(&app).await.len(), n0 + 1);
+    let (_, log) = api(&app, "GET", "/api/audit?limit=1", None).await;
+    let e = &log["entries"][0];
+    assert_eq!((e["action"].as_str(), e["entity"].as_str()), (Some("account_updated"), Some("account:demo-1")));
+    assert_eq!((e["detail"]["old"]["credits"]["USDT"].as_str(), e["detail"]["new"]["credits"]["USDT"].as_str()), (Some("10000"), Some("12000")));
+    assert!(e["detail"]["new"]["credits"].get("INR").is_none(), "only changed fields are logged");
+
+    // a label alone leaves wallets alone; a no-op writes nothing
+    let (_, a) = api(&app, "PATCH", "/api/accounts/demo-1", Some(json!({"label": "Practice"}))).await;
+    assert_eq!((a["label"].as_str(), wallet(&a, "USDT")["credits"].as_str()), (Some("Practice"), Some("12000")));
+    let n1 = audit_actions(&app).await.len();
+    assert_eq!(api(&app, "PATCH", "/api/accounts/demo-1", Some(json!({"label": "Practice", "credits": {"USDT": "12000"}}))).await.0, StatusCode::OK);
+    assert_eq!(audit_actions(&app).await.len(), n1, "a no-op PATCH must not audit");
+
+    // all or nothing: a bad INR value must leave USDT unchanged and write nothing
+    let (s, _) = api(&app, "PATCH", "/api/accounts/demo-1", Some(json!({"credits": {"USDT": "5", "INR": "abc"}}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (_, a) = api(&app, "GET", "/api/accounts", None).await;
+    assert_eq!(wallet(&a["accounts"][0], "USDT")["credits"], "12000");
+    assert_eq!(audit_actions(&app).await.len(), n1);
+    // the audit detail keeps `credits` and `balance` readable (they are not secret-shaped fields)
+    assert_eq!(log["entries"][0]["detail"]["new"]["credits"]["USDT"], "12000");
+}
+
+#[tokio::test]
+async fn patch_rejects_everything_but_label_and_credits() {
+    let app = router();
+    for body in [json!({"balance": "1"}), json!({"virtual": false}), json!({"kind": "fyers"}), json!({"id": "x"}), json!({"status": "closed"}), json!({"archived": true}), json!({"label": "ok", "balance": "9"}), json!({"label": 5}), json!({"credits": "lots"})] {
+        let (s, e) = api(&app, "PATCH", "/api/accounts/demo-1", Some(body.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+        assert!(e["error"].is_string());
+    }
+    assert_eq!(api(&app, "PATCH", "/api/accounts/demo-1", Some(json!([1]))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(api(&app, "PATCH", "/api/accounts/nope", Some(json!({"label": "x"}))).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(api(&app, "POST", "/api/accounts/nope/reset", None).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(audit_actions(&app).await.iter().filter(|a| *a == "account_updated").count(), 0);
+}
+
+#[tokio::test]
+async fn reset_restores_credits_removes_positions_keeps_trades_and_other_accounts() {
+    let app = router();
+    api(&app, "POST", "/api/accounts", Some(json!({"label": "Second"}))).await;
+    // demo-1: one closed trade (P&L), one open position
+    let (_, p) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 1.0, 100.0, "long"))).await;
+    api(&app, "POST", &format!("/api/positions/{}/close", p["position"]["id"]), Some(json!({"price": 150}))).await;
+    api(&app, "POST", "/api/positions", Some(buy("ETHUSDT", 2.0, 100.0, "long"))).await;
+    // demo-2 has its own open position
+    api(&app, "POST", "/api/positions", Some(order(json!({"account_id": "demo-2", "qty": 0.01})))).await;
+
+    let (s, a) = api(&app, "POST", "/api/accounts/demo-1/reset", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_virtual(&a);
+    let usdt = wallet(&a, "USDT");
+    assert_eq!((usdt["balance"].as_str(), usdt["in_positions"].as_str(), a["open_positions"].as_i64()), (Some("10000"), Some("0"), Some(0)));
+    let (_, j) = api(&app, "GET", "/api/journal?market=crypto&mode=demo", None).await;
+    assert_eq!(j["trades"].as_array().unwrap().len(), 1, "reset keeps trade history");
+    let (_, all) = api(&app, "GET", "/api/accounts", None).await;
+    assert_eq!(all["accounts"][1]["open_positions"], 1, "another account is untouched");
+
+    let (_, log) = api(&app, "GET", "/api/audit?limit=1", None).await;
+    let e = &log["entries"][0];
+    assert_eq!(e["action"], "account_reset");
+    assert_eq!(e["detail"]["positions_removed"], 1);
+    assert_eq!(e["detail"]["positions"][0]["symbol"], "ETHUSDT");
+    assert_eq!(e["detail"]["balance_after"]["USDT"], "10000");
+    assert_ne!(e["detail"]["balance_before"]["USDT"], "10000");
+}
+
+#[tokio::test]
+async fn deleting_a_paper_trade_does_not_conjure_funds() {
+    let app = router();
+    let (_, p) = api(&app, "POST", "/api/positions", Some(buy("BTCUSDT", 1.0, 100.0, "long"))).await;
+    let (_, c) = api(&app, "POST", &format!("/api/positions/{}/close", p["position"]["id"]), Some(json!({"price": 50}))).await;
+    let (_, before) = api(&app, "GET", "/api/accounts", None).await;
+    api(&app, "DELETE", &format!("/api/journal/{}", c["trade"]["id"]), None).await;
+    let (_, after) = api(&app, "GET", "/api/accounts", None).await;
+    assert_eq!(before["accounts"][0]["wallets"], after["accounts"][0]["wallets"]);
+}
+
+#[tokio::test]
+async fn account_responses_and_audit_rows_never_carry_secret_shaped_data() {
+    let app = router();
+    api(&app, "POST", "/api/accounts", Some(json!({"label": "Second"}))).await;
+    api(&app, "PATCH", "/api/accounts/demo-1", Some(json!({"credits": {"INR": "5"}}))).await;
+    api(&app, "POST", "/api/accounts/demo-2/reset", None).await;
+    let mut text = api(&app, "GET", "/api/accounts", None).await.1.to_string();
+    text += &api(&app, "GET", "/api/audit?limit=500", None).await.1.to_string();
+    assert!(!text.contains(&app.token), "the API token must not appear in accounts or audit output");
+    assert!(!text.contains("[REDACTED]"), "no demo field is secret-shaped, so nothing should be masked: {text}");
+    for word in ["secret", "api_key", "apikey", "password"] {
+        assert!(!text.to_lowercase().contains(word), "{word}");
+    }
 }

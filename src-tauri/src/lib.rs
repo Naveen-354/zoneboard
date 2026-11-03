@@ -1,6 +1,7 @@
 //! ZoneBoard core: the zone engine, market data, trade journal, backtest and the local web server.
 //! The desktop window (`main.rs`), the headless server and the backtest CLI are thin shells around this.
 
+pub mod accounts;
 pub mod audit;
 pub mod backtest;
 pub mod data;

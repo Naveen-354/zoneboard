@@ -11,7 +11,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use chrono::{FixedOffset, Utc};
@@ -146,6 +146,9 @@ pub fn app(state: Shared) -> Router {
         .route("/api/positions/{id}/close", post(positions_close))
         .route("/api/audit", get(audit_get))
         .route("/api/settings", get(settings_get).put(settings_put))
+        .route("/api/accounts", get(accounts_get).post(accounts_create))
+        .route("/api/accounts/{id}", patch(accounts_patch))
+        .route("/api/accounts/{id}/reset", post(accounts_reset))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -368,7 +371,7 @@ fn json_body(headers: &HeaderMap, body: &[u8]) -> Value {
 
 async fn journal_get(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
     match market_mode(&q) {
-        Ok((market, mode)) => Json(s.journal.payload(market, mode)).into_response(),
+        Ok((market, mode)) => Json(s.journal.payload_for(market, mode, q.get("account_id").map(String::as_str))).into_response(),
         Err(r) => r,
     }
 }
@@ -388,7 +391,7 @@ async fn journal_delete(State(s): State<Shared>, Path(id): Path<i64>) -> Json<Va
 // Paper trading: simulated orders at the price the page sends. See journal.rs.
 async fn positions_get(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
     match market_mode(&q) {
-        Ok((market, mode)) => Json(json!({ "positions": s.journal.positions(market, mode) })).into_response(),
+        Ok((market, mode)) => Json(json!({ "positions": s.journal.positions_for(market, mode, q.get("account_id").map(String::as_str)) })).into_response(),
         Err(r) => r,
     }
 }
@@ -468,6 +471,35 @@ async fn settings_put(
         Err(crate::settings::SettingsError::Validation(msg)) => err(StatusCode::BAD_REQUEST, &msg),
         Err(crate::settings::SettingsError::Database(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {e}")),
     }
+}
+
+// Accounts and their virtual funds (T005). Every balance in these responses carries "virtual": true.
+fn account_response(r: Result<Value, crate::accounts::AccountError>, ok: StatusCode) -> Response {
+    use crate::accounts::AccountError;
+    match r {
+        Ok(v) => (ok, Json(v)).into_response(),
+        Err(AccountError::NotFound) => err(StatusCode::NOT_FOUND, "no such account"),
+        Err(AccountError::Invalid(m)) => err(StatusCode::BAD_REQUEST, &m),
+        Err(AccountError::Db(m)) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {m}")),
+    }
+}
+
+async fn accounts_get(State(s): State<Shared>) -> Response {
+    account_response(s.journal.with_conn(|c| crate::accounts::list(c)), StatusCode::OK)
+}
+
+async fn accounts_create(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    account_response(s.journal.with_conn(|c| crate::accounts::create(c, &b)), StatusCode::CREATED)
+}
+
+async fn accounts_patch(State(s): State<Shared>, Path(id): Path<String>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    account_response(s.journal.with_conn(|c| crate::accounts::update(c, &id, &b)), StatusCode::OK)
+}
+
+async fn accounts_reset(State(s): State<Shared>, Path(id): Path<String>) -> Response {
+    account_response(s.journal.with_conn(|c| crate::accounts::reset(c, &id)), StatusCode::OK)
 }
 
 // ------------------------------------------------------------------ serving
