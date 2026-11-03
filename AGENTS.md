@@ -17,6 +17,7 @@ ZoneBoard is a personal scanner, chart, journal, backtester and paper-trading to
 cd src-tauri && cargo test --no-default-features     # Rust: unit, HTTP API, Python-parity tests
 python -m pytest -q                                   # Python: API, zones, JS-vs-Python zone parity
 node tools/live_check.mjs                             # live Binance pipeline (needs internet)
+node tools/ui_smoke.mjs                              # browser smoke test on sample data (needs the server built and Edge/Chrome; no internet)
 ```
 
 - Run **one cargo command at a time** (shared build lock) and don't edit sources while a build runs.

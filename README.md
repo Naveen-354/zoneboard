@@ -95,6 +95,7 @@ Only for development: `SAMPLE_DATA=1` (PowerShell: `$env:SAMPLE_DATA = "1"`) on 
 - Data feed health shows top right: `Live · N msg/s`. It reconnects and refills itself if the socket drops or goes silent for 10 s. Subscription changes are batched so Binance's 5-messages-per-second limit is never hit.
 - Open it at `http://127.0.0.1:5000` (the Rust server also answers on `localhost`; the Flask dev server is slower on `localhost` under Windows because of the IPv6 fallback).
 - To check the live pipeline from this machine without opening the app: `node tools/live_check.mjs` (REST, WebSocket ticks, and zone analysis on real candles).
+- To smoke-test the UI in a headless browser (sample data, temp journal, no internet): build the server once (`cd src-tauri && cargo build --no-default-features --bin zoneboard-server`), then `node tools/ui_smoke.mjs`.
 
 ## Backtest
 
