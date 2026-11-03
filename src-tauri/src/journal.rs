@@ -115,6 +115,12 @@ impl Journal {
         Ok(Self { conn: Mutex::new(conn) })
     }
 
+    /// Access the underlying SQLite connection inside a closure helper.
+    pub fn with_conn<R>(&self, f: impl FnOnce(&mut Connection) -> R) -> R {
+        let mut conn = self.conn.lock().unwrap();
+        f(&mut conn)
+    }
+
     const TRADE_COLS: &'static str = "id, date, symbol, side, qty, entry, exit, fees, notes, market, mode";
 
     fn trade_from_row(r: &rusqlite::Row) -> rusqlite::Result<Trade> {

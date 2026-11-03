@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 /// The latest schema version supported by this application.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Database error type covering schema version mismatches, SQLite errors, and IO issues.
 #[derive(Debug)]
@@ -152,6 +152,52 @@ pub fn migrate(conn: &mut Connection) -> Result<(), DbError> {
             [],
         )?;
         tx.execute_batch("PRAGMA user_version = 2;")?;
+        tx.commit()?;
+        ver = 2;
+    }
+
+    if ver < 3 {
+        let tx = conn.transaction()?;
+        // Migration 3: audit_log table with append-only triggers, and settings store.
+        // Triggers stop accidental and application-level edits; someone with direct file access
+        // can still drop the triggers or table (a cryptographic hash chain is a later phase).
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_utc TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                entity TEXT NOT NULL,
+                detail_json TEXT NOT NULL
+            );
+
+            CREATE TRIGGER IF NOT EXISTS audit_log_no_update
+            BEFORE UPDATE ON audit_log
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_log is append-only: UPDATE is forbidden');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_log_no_delete
+            BEFORE DELETE ON audit_log
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_log is append-only: DELETE is forbidden');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS audit_log_no_replace
+            BEFORE INSERT ON audit_log
+            WHEN EXISTS (SELECT 1 FROM audit_log WHERE id = NEW.id)
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_log is append-only: REPLACE is forbidden');
+            END;
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_utc TEXT NOT NULL
+            );
+
+            PRAGMA user_version = 3;",
+        )?;
         tx.commit()?;
     }
 

@@ -44,6 +44,18 @@ pub type Shared = Arc<AppState>;
 impl AppState {
     pub fn new(sample: bool, journal_path: &str) -> Result<Shared, String> {
         let journal = Journal::open(journal_path).map_err(|e| format!("can't open journal {journal_path}: {e}"))?;
+        journal.with_conn(|conn| {
+            crate::audit::record(
+                conn,
+                "system",
+                "app_start",
+                "system",
+                &json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "sample": sample,
+                }),
+            )
+        }).map_err(|e| format!("can't record app_start audit entry: {e}"))?;
         Ok(Arc::new(Self { data: DataStore::new(sample), journal, scan: [Mutex::new(None), Mutex::new(None)] }))
     }
 
@@ -76,6 +88,8 @@ pub fn app(state: Shared) -> Router {
         .route("/api/journal/{id}", delete(journal_delete))
         .route("/api/positions", get(positions_get).post(positions_open))
         .route("/api/positions/{id}/close", post(positions_close))
+        .route("/api/audit", get(audit_get))
+        .route("/api/settings", get(settings_get).put(settings_put))
         .layer(middleware::from_fn(guard))
         .with_state(state)
 }
@@ -289,6 +303,59 @@ async fn positions_close(State(s): State<Shared>, Path(id): Path<i64>, headers: 
         Ok(t) => Json(json!({ "ok": true, "trade": t })).into_response(),
         Err(journal::CloseError::NotFound) => err(StatusCode::NOT_FOUND, "no such open position"),
         Err(journal::CloseError::Invalid(m)) => err(StatusCode::BAD_REQUEST, &m),
+    }
+}
+
+async fn audit_get(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let limit = match q.get("limit") {
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) | Err(_) => return err(StatusCode::BAD_REQUEST, "limit must be a positive integer"),
+            Ok(n) => n.min(500),
+        },
+        None => 50,
+    };
+
+    let before = match q.get("before") {
+        Some(s) => match s.parse::<i64>() {
+            Ok(id) if id > 0 => Some(id),
+            _ => return err(StatusCode::BAD_REQUEST, "before must be a positive integer"),
+        },
+        None => None,
+    };
+
+    let result = s.journal.with_conn(|conn| crate::audit::list(conn, limit, before));
+    match result {
+        Ok((entries, next_before)) => {
+            Json(json!({ "entries": entries, "next_before": next_before })).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("audit query failed: {e}")),
+    }
+}
+
+async fn settings_get(State(s): State<Shared>) -> Response {
+    match s.journal.with_conn(|conn| crate::settings::get_settings(conn)) {
+        Ok(settings) => Json(settings).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("failed to get settings: {e}")),
+    }
+}
+
+async fn settings_put(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let body_json = json_body(&headers, &body);
+    let body_obj = match body_json {
+        Value::Object(map) => map,
+        _ => return err(StatusCode::BAD_REQUEST, "request body must be a JSON object"),
+    };
+
+    let result = s.journal.with_conn(|conn| crate::settings::update_settings(conn, &body_obj));
+    match result {
+        Ok(updated) => Json(updated).into_response(),
+        Err(crate::settings::SettingsError::RuntimeOnlyKey(msg)) => err(StatusCode::BAD_REQUEST, &msg),
+        Err(crate::settings::SettingsError::Validation(msg)) => err(StatusCode::BAD_REQUEST, &msg),
+        Err(crate::settings::SettingsError::Database(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {e}")),
     }
 }
 

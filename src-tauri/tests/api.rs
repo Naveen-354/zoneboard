@@ -227,3 +227,135 @@ async fn journal_is_per_market_and_validated() {
     assert_eq!(call(&r, "DELETE", &format!("/api/journal/{id}"), "localhost", None, &[]).await.0, StatusCode::OK);
     assert_eq!(get_json(&r, "/api/journal?market=crypto").await.1["trades"].as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn audit_log_records_app_start_and_paginates_with_cursor() {
+    let r = router();
+
+    // AppState::new records an app_start entry on startup
+    let (s, res) = get_json(&r, "/api/audit").await;
+    assert_eq!(s, StatusCode::OK);
+    let entries = res["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["action"], "app_start");
+    assert_eq!(entries[0]["actor"], "system");
+    assert_eq!(entries[0]["entity"], "system");
+    assert_eq!(res["next_before"], Value::Null);
+
+    // Query validation tests: invalid limits and cursors return 400 JSON
+    assert_eq!(get_json(&r, "/api/audit?limit=0").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(get_json(&r, "/api/audit?limit=abc").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(get_json(&r, "/api/audit?before=abc").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(get_json(&r, "/api/audit?before=0").await.0, StatusCode::BAD_REQUEST);
+
+    // Generate 3 settings updates to test cursor pagination
+    let timezones = ["Asia/Kolkata", "America/New_York", "Europe/London"];
+    for tz in timezones {
+        let (st, _, _) = call(&r, "PUT", "/api/settings", "localhost", Some(json!({ "timezone": tz })), &[]).await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    // Total audit entries: 1 app_start + 3 settings_update = 4 entries
+    let (s, res) = get_json(&r, "/api/audit?limit=2").await;
+    assert_eq!(s, StatusCode::OK);
+    let page1 = res["entries"].as_array().unwrap();
+    assert_eq!(page1.len(), 2);
+    let next_cursor = res["next_before"].as_i64().unwrap();
+    assert_eq!(next_cursor, page1[1]["id"].as_i64().unwrap());
+
+    // Page 2
+    let (s, res) = get_json(&r, &format!("/api/audit?limit=2&before={next_cursor}")).await;
+    assert_eq!(s, StatusCode::OK);
+    let page2 = res["entries"].as_array().unwrap();
+    assert_eq!(page2.len(), 2);
+    // When exactly 4 items and limit=2, next_before is None because no items remain after page 2
+    assert_eq!(res["next_before"], Value::Null);
+}
+
+#[tokio::test]
+async fn settings_get_and_put_lifecycle() {
+    let r = router();
+
+    // Default settings match spec
+    let (s, res) = get_json(&r, "/api/settings").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(res["timezone"], "UTC");
+    assert_eq!(res["notifications.desktop"], false);
+    assert_eq!(res["preferences.default_account"], Value::Null);
+
+    // Update settings
+    let update_payload = json!({
+        "timezone": "Asia/Kolkata",
+        "notifications.desktop": true,
+        "preferences.default_account": "demo"
+    });
+    let (s, _, b) = call(&r, "PUT", "/api/settings", "localhost", Some(update_payload), &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    let updated: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(updated["timezone"], "Asia/Kolkata");
+    assert_eq!(updated["notifications.desktop"], true);
+    assert_eq!(updated["preferences.default_account"], "demo");
+
+    // GET verifies persisted changes
+    let (s, res) = get_json(&r, "/api/settings").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(res["timezone"], "Asia/Kolkata");
+    assert_eq!(res["notifications.desktop"], true);
+    assert_eq!(res["preferences.default_account"], "demo");
+
+    // Verify audit entry contains old and new values
+    let (s, audit) = get_json(&r, "/api/audit?limit=1").await;
+    assert_eq!(s, StatusCode::OK);
+    let latest = &audit["entries"].as_array().unwrap()[0];
+    assert_eq!(latest["action"], "settings_update");
+    assert_eq!(latest["actor"], "user");
+    assert_eq!(latest["entity"], "settings");
+    assert_eq!(latest["detail"]["old"]["timezone"], "UTC");
+    assert_eq!(latest["detail"]["new"]["timezone"], "Asia/Kolkata");
+    assert_eq!(latest["detail"]["old"]["notifications.desktop"], false);
+    assert_eq!(latest["detail"]["new"]["notifications.desktop"], true);
+    assert_eq!(latest["detail"]["old"]["preferences.default_account"], Value::Null);
+    assert_eq!(latest["detail"]["new"]["preferences.default_account"], "demo");
+}
+
+#[tokio::test]
+async fn settings_put_validation_and_all_or_nothing() {
+    let r = router();
+
+    // Invalid timezone -> 400
+    let (s, _, b) = call(&r, "PUT", "/api/settings", "localhost", Some(json!({ "timezone": "Mars/Olympus" })), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&b).contains("invalid timezone"));
+
+    // Case matters for timezone -> 400
+    let (s, _, b) = call(&r, "PUT", "/api/settings", "localhost", Some(json!({ "timezone": "asia/kolkata" })), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&b).contains("invalid timezone"));
+
+    // live_armed -> 400 with runtime-only message
+    let (s, _, b) = call(&r, "PUT", "/api/settings", "localhost", Some(json!({ "live_armed": true })), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let msg = String::from_utf8_lossy(&b);
+    assert!(msg.contains("live_armed") && msg.contains("runtime-only"), "msg: {msg}");
+
+    // Unknown setting key -> 400
+    let (s, _, b) = call(&r, "PUT", "/api/settings", "localhost", Some(json!({ "some_unknown_key": "val" })), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&b).contains("unknown setting key"));
+
+    // All-or-nothing test: valid setting combined with invalid key must NOT update anything
+    let (s, _, _) = call(
+        &r,
+        "PUT",
+        "/api/settings",
+        "localhost",
+        Some(json!({ "timezone": "America/New_York", "invalid_key": 42 })),
+        &[],
+    ).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Setting remains at default UTC
+    let (s, res) = get_json(&r, "/api/settings").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(res["timezone"], "UTC");
+}
