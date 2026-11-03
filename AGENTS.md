@@ -1,6 +1,6 @@
 # AGENTS.md: standing rules for any coding agent in this repo
 
-ZoneBoard is a personal learning tool: a scanner, chart, journal and backtester for **live crypto** (Binance public data) and **NSE stocks** (Yahoo, ~15 min delayed, being upgraded to live via Fyers). Read `README.md` first for what it does and how to run it.
+ZoneBoard is a personal scanner, chart, journal, backtester and paper-trading tool for **live crypto** (Binance public data) and **NSE stocks** (Yahoo, ~15 min delayed, being upgraded via FYERS). It is being developed into a personal algo-trading platform in gated phases: **`docs/platform/ROADMAP.md` is the plan, `docs/platform/WORKFLOW.md` is how delegated work runs, `docs/platform/PROGRESS.md` is the current state.** Read `README.md` first for what exists and how to run it.
 
 ## Working agreement
 
@@ -9,6 +9,7 @@ ZoneBoard is a personal learning tool: a scanner, chart, journal and backtester 
 3. **Follow the spec when there is one.** A task that points at a file in `docs/` (for example `docs/fyers/SPEC.md`) is governed by it. If the spec is wrong or something it marks UNVERIFIED turns out different in practice, **stop, say what you found, and ask**. Do not silently deviate.
 4. **Ask before anything costs money, needs a credential, or is hard to undo.** The owner has said: *if you need an API key, ask first.* Never invent, guess, or request keys in chat.
 5. **Report honestly.** If a test fails or a step is skipped, say so with the output.
+6. **Delegated tasks** (`docs/platform/tasks/Txxx-*.md`): the spec is your contract. Work only in your own git worktree and branch, never push, and finish with the report format in `docs/platform/WORKFLOW.md` section 5. In plan mode you only plan; in implement mode you proceed per the spec without waiting.
 
 ## Checks (run all that apply before saying "done")
 
@@ -50,13 +51,21 @@ docs/                   specs and guides
 
 ## Secrets (hard rules)
 
-- Credentials live only in a local, git-ignored `.env` (template: `.env.example`) and token files under the user's data folder. They never go in source, tests, fixtures, logs, error messages, URLs, commit messages, chat, or the browser.
+- Credentials live only in the OS keychain vault (`vault.rs`, task T004) once it exists, and until then in a local, git-ignored `.env` (template: `.env.example`) and token files under the user's data folder. They never go in source, tests, fixtures, logs, error messages, URLs, commit messages, chat, the database, or the browser. APIs may show only a key hint (last 4 characters).
 - Redact tokens, app secrets and auth codes in every log line and error string. Add a test that proves it.
 - The browser never sees a broker token. Anything that needs one runs in the Rust server.
 - Tests and CI must run with **no real credentials and no network**: use local fake servers and recorded fixtures.
 
 ## Scope guardrails
 
-- This tool **reads market data**. It does **not place, modify or cancel orders**, and must not request trading permissions from any broker.
+- **Real orders are built in phases, behind gates (`docs/platform/ROADMAP.md` section 5). Until a task explicitly builds them and the owner arms them, none exist.** In particular:
+  - **No code path may send a real order** unless ALL hold: the account is a connected live (non-paper) account; the owner has **armed** live trading in Settings with a typed confirmation (runtime-only state, **disarmed after every restart**); per-account limits (order size, daily loss, exposure) are set; the risk checks pass; a kill switch exists.
+  - Default builds, tests, CI and **agents never contact a live trading endpoint**. Use fakes, recorded fixtures, the paper exchange, or the Binance Spot Testnet with throwaway keys the owner creates. **Agents never run live verification; only the owner does, by hand.**
+  - **Reject any Binance API key that can withdraw funds**, and never ask for or use withdrawal permission. FYERS apps are created with the permissions the task needs and no more.
+  - **Never simulate real balances or present virtual funds as real.** Demo-account credits are labelled VIRTUAL everywhere; real balances come from the broker or show "not connected". The app holds no money.
+  - Money in new code uses decimals, never `f64`.
+  - Paper trading (the Demo account, `/api/positions`, `static/js/trading.js`) stays: simulated fills at the price on screen, always labelled.
+- **Two different things were both once called "demo". Keep them apart.** The *account* (`mode` = `demo`/`live`, the toggle top right): demo = paper orders on **real** prices, live = real orders, which are not supported (the server rejects them). *Sample data* (`SAMPLE_DATA=1`, `?sample`, API `sample`): made-up prices for development and tests only, with ordering switched off. Tests run on sample data; never make the account toggle change which data is shown.
+- The market modules expose `quote(sym)` (last price and decimals) and `watch(symbols)` (keep prices flowing for open positions): the ticket depends on them. Keep both when you generalise or add a market (for example live NSE).
 - Don't add telemetry, analytics, auto-updaters, or any outbound call to a host not named in the spec.
 - It is an educational tool, not investment advice. Keep that in the UI footer.

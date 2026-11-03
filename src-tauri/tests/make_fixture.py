@@ -10,7 +10,7 @@ import os
 import sys
 from pathlib import Path
 
-os.environ["DEMO"] = "1"
+os.environ["SAMPLE_DATA"] = "1"
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 

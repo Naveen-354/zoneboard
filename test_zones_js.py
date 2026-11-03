@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-os.environ["DEMO"] = "1"
+os.environ["SAMPLE_DATA"] = "1"
 
 import pytest
 

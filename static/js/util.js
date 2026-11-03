@@ -36,6 +36,14 @@ export function fmtAuto(n) {
   return f.format(n);
 }
 
+/** Quantities: no forced decimals (10 stays 10, 0.0153 stays 0.0153), up to 8 places. */
+export function fmtQty(n) {
+  if (n == null || Number.isNaN(n)) return "–";
+  let f = cache.get("q");
+  if (!f) cache.set("q", (f = new Intl.NumberFormat(cfg.locale, { maximumFractionDigits: 8 })));
+  return f.format(n);
+}
+
 export function fmtCompact(n) {
   if (n == null || Number.isNaN(n)) return "–";
   let f = cache.get("c");

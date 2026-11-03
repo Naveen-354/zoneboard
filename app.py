@@ -1,7 +1,7 @@
 """ZoneBoard: a personal F&O scanner + chart + journal using free, delayed data.
 
 Run:  python app.py       then open http://127.0.0.1:5000
-Demo: DEMO=1 python app.py   (synthetic data, no internet needed)
+Sample data: SAMPLE_DATA=1 python app.py   (made-up prices for development; no internet needed)
 """
 from __future__ import annotations
 
@@ -25,6 +25,11 @@ app = Flask(__name__, static_folder=None)
 SYMBOL_RE = re.compile(r"^[A-Z0-9&\-]{1,20}$")
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKETS = ("crypto", "india")
+# The account. "demo" = paper trading on real prices (the only account that can place orders here).
+# "live" = real orders, which this app does not place: no broker is connected.
+MODES = ("live", "demo")
+# Simulated fee per side, percent of notional. Round trip 0.2% / 0.1%: the same costs the backtest assumes.
+FEE_PCT = {"crypto": 0.1, "india": 0.05}
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 
 # The page loads its own scripts only, and may talk to Binance's public data hosts and nobody else.
@@ -58,18 +63,26 @@ def security_headers(resp):
 @app.get("/api/config")
 def config():
     return jsonify(
-        demo=data.DEMO,
+        sample=data.SAMPLE,
         crypto={"symbols": data.load_crypto_symbols()},
         india={"count": len(data.load_symbols())},
+        fees=FEE_PCT,
     )
+
+
+def want_sample() -> bool:
+    """?sample=1 / ?sample=0 on a request; without it, the SAMPLE_DATA=1 environment decides."""
+    v = request.args.get("sample")
+    return data.SAMPLE if v is None else v in ("1", "true")
+
 
 # ---------------------------------------------------------------- scanner
 _scan_lock = threading.Lock()
-_scan_cache: dict = {"t": 0, "value": None}
+_scan_cache: dict = {}  # sample flag -> {"t": time, "value": scan}
 
 
-def run_scan() -> dict:
-    frames = data.daily_all()
+def run_scan(sample: bool) -> dict:
+    frames = data.daily_all(sample=sample)
     rows = []
     for sym, df in frames.items():
         try:
@@ -90,7 +103,7 @@ def run_scan() -> dict:
     keep = ("symbol", "price", "change_pct", "score", "label")
     return {
         "updated": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-        "demo": data.DEMO,
+        "sample": sample,
         "counts": counts,
         "bullish": bull,
         "bearish": bear,
@@ -100,11 +113,12 @@ def run_scan() -> dict:
 
 @app.get("/api/scan")
 def scan():
+    sample = want_sample()
     with _scan_lock:
-        if time.time() - _scan_cache["t"] > 60 or _scan_cache["value"] is None:
-            _scan_cache["value"] = run_scan()
-            _scan_cache["t"] = time.time()
-        return jsonify(_scan_cache["value"])
+        hit = _scan_cache.get(sample)
+        if hit is None or time.time() - hit["t"] > 60:
+            hit = _scan_cache[sample] = {"t": time.time(), "value": run_scan(sample)}
+        return jsonify(hit["value"])
 
 
 # ------------------------------------------------------------------ chart
@@ -116,7 +130,7 @@ def chart(symbol: str):
     interval = request.args.get("interval", "1d")
     if interval not in data.INTERVALS:
         return jsonify(error="interval must be one of " + ", ".join(data.INTERVALS)), 400
-    df = data.get_ohlcv(symbol, interval)
+    df = data.get_ohlcv(symbol, interval, sample=want_sample())
     if df is None or len(df) < 40:
         return jsonify(error=f"no data for {symbol} (check the symbol or your connection)"), 404
 
@@ -160,13 +174,30 @@ _conn.execute(
         date TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
         qty REAL NOT NULL, entry REAL NOT NULL, exit REAL NOT NULL,
         fees REAL NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '',
-        market TEXT NOT NULL DEFAULT 'india'
+        market TEXT NOT NULL DEFAULT 'india',
+        mode TEXT NOT NULL DEFAULT 'live'
     )"""
 )
-# Journals made before crypto existed have no market column: those trades were all NSE.
+# Older journals: no market column (those trades were all NSE), no mode column (all live prices).
 # (The old qty column was declared INTEGER; SQLite still stores fractional values in it as-is.)
-if "market" not in {r["name"] for r in _conn.execute("PRAGMA table_info(trades)")}:
+_cols = {r["name"] for r in _conn.execute("PRAGMA table_info(trades)")}
+if "market" not in _cols:
     _conn.execute("ALTER TABLE trades ADD COLUMN market TEXT NOT NULL DEFAULT 'india'")
+if "mode" not in _cols:
+    _conn.execute("ALTER TABLE trades ADD COLUMN mode TEXT NOT NULL DEFAULT 'live'")
+# Open paper positions. Closing one writes a row to `trades` and deletes it here.
+_conn.execute(
+    """CREATE TABLE IF NOT EXISTS positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        market TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'live',
+        symbol TEXT NOT NULL, side TEXT NOT NULL,
+        qty REAL NOT NULL, entry REAL NOT NULL, fee_pct REAL NOT NULL, opened_at TEXT NOT NULL
+    )"""
+)
+# An earlier build recorded the order ticket's paper trades under "live" (meaning real prices). They were never
+# real orders, so they belong to the demo account. Journal entries typed in by hand (any other note) stay live.
+_conn.execute("UPDATE trades SET mode = 'demo' WHERE mode = 'live' AND notes = 'Paper trade'")
+_conn.execute("UPDATE positions SET mode = 'demo' WHERE mode = 'live'")
 _conn.commit()
 
 
@@ -175,10 +206,14 @@ def _pnl(r) -> float:
     return gross - r["fees"]
 
 
-def _journal_payload(market: str) -> dict:
+def _trade_dict(r) -> dict:
+    return {**dict(r), "pnl": round(_pnl(r), 2)}
+
+
+def _journal_payload(market: str, mode: str) -> dict:
     with _db_lock:
-        rows = _conn.execute("SELECT * FROM trades WHERE market = ? ORDER BY date DESC, id DESC", (market,)).fetchall()
-    trades = [{**dict(r), "pnl": round(_pnl(r), 2)} for r in rows]
+        rows = _conn.execute("SELECT * FROM trades WHERE market = ? AND mode = ? ORDER BY date DESC, id DESC", (market, mode)).fetchall()
+    trades = [_trade_dict(r) for r in rows]
     pnls = np.array([t["pnl"] for t in trades], dtype=float)
     wins, losses = pnls[pnls > 0], pnls[pnls <= 0]
     stats = {
@@ -193,12 +228,21 @@ def _journal_payload(market: str) -> dict:
     return {"trades": trades, "stats": stats}
 
 
+def _check_market_mode(market: str, mode: str) -> None:
+    if market not in MARKETS:
+        raise ValueError("market must be one of " + ", ".join(MARKETS))
+    if mode not in MODES:
+        raise ValueError("mode must be one of " + ", ".join(MODES))
+
+
 @app.get("/api/journal")
 def journal_get():
-    market = request.args.get("market", "india")
-    if market not in MARKETS:
-        return jsonify(error="market must be one of " + ", ".join(MARKETS)), 400
-    return jsonify(_journal_payload(market))
+    market, mode = request.args.get("market", "india"), request.args.get("mode", "live")
+    try:
+        _check_market_mode(market, mode)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(_journal_payload(market, mode))
 
 
 @app.post("/api/journal")
@@ -208,14 +252,14 @@ def journal_add():
         date = str(b.get("date", ""))
         datetime.strptime(date, "%Y-%m-%d")
         market = str(b.get("market") or "india")
+        mode = str(b.get("mode") or "live")
         symbol = str(b.get("symbol", "")).upper().strip()
         side = str(b.get("side", "")).lower()
         qty = float(b.get("qty"))
         entry, exit_ = float(b.get("entry")), float(b.get("exit"))
         fees = float(b.get("fees") or 0)
         notes = str(b.get("notes", ""))[:500]
-        if market not in MARKETS:
-            raise ValueError("market must be one of " + ", ".join(MARKETS))
+        _check_market_mode(market, mode)
         if not SYMBOL_RE.match(symbol) or side not in ("long", "short"):
             raise ValueError("symbol or side invalid")
         if not all(np.isfinite([qty, entry, exit_, fees])):
@@ -228,8 +272,8 @@ def journal_add():
         return jsonify(error=f"invalid trade: {e}"), 400
     with _db_lock:
         _conn.execute(
-            "INSERT INTO trades (date, symbol, side, qty, entry, exit, fees, notes, market) VALUES (?,?,?,?,?,?,?,?,?)",
-            (date, symbol, side, qty, entry, exit_, fees, notes, market),
+            "INSERT INTO trades (date, symbol, side, qty, entry, exit, fees, notes, market, mode) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (date, symbol, side, qty, entry, exit_, fees, notes, market, mode),
         )
         _conn.commit()
     return jsonify(ok=True), 201
@@ -241,6 +285,87 @@ def journal_delete(trade_id: int):
         _conn.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
         _conn.commit()
     return jsonify(ok=True)
+
+
+# -------------------------------------------------------- paper positions
+# Orders are simulated: a market order fills at the price the page sends (the real price on screen).
+# Closing a position records it in the journal. No broker is involved and no real money moves, so only the
+# demo account can open positions: a "live" order would claim a real trade that never happened.
+def _positive(v, name: str) -> float:
+    x = float(v)
+    if not np.isfinite(x) or x <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return x
+
+
+@app.get("/api/positions")
+def positions_get():
+    market, mode = request.args.get("market", "india"), request.args.get("mode", "demo")
+    try:
+        _check_market_mode(market, mode)
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    with _db_lock:
+        rows = _conn.execute("SELECT * FROM positions WHERE market = ? AND mode = ? ORDER BY id DESC", (market, mode)).fetchall()
+    return jsonify(positions=[dict(r) for r in rows])
+
+
+@app.post("/api/positions")
+def positions_open():
+    b = request.get_json(silent=True) or {}
+    try:
+        market, mode = str(b.get("market") or "india"), str(b.get("mode") or "demo")
+        _check_market_mode(market, mode)
+        if mode != "demo":
+            raise ValueError("live orders aren't supported: no broker is connected, so only the demo account can trade")
+        symbol = str(b.get("symbol", "")).upper().strip()
+        side = str(b.get("side", "")).lower()
+        if not SYMBOL_RE.match(symbol) or side not in ("long", "short"):
+            raise ValueError("symbol or side invalid")
+        qty, price = _positive(b.get("qty"), "qty"), _positive(b.get("price"), "price")
+        if market == "india" and qty != int(qty):
+            raise ValueError("NSE quantity must be a whole number")
+    except (ValueError, TypeError) as e:
+        return jsonify(error=f"invalid order: {e}"), 400
+    opened = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _db_lock:
+        cur = _conn.execute(
+            "INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at) VALUES (?,?,?,?,?,?,?,?)",
+            (market, mode, symbol, side, qty, price, FEE_PCT[market], opened),
+        )
+        _conn.commit()
+        row = _conn.execute("SELECT * FROM positions WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return jsonify(ok=True, position=dict(row)), 201
+
+
+@app.post("/api/positions/<int:pid>/close")
+def positions_close(pid: int):
+    b = request.get_json(silent=True) or {}
+    try:
+        price = _positive(b.get("price"), "price")
+        date = b.get("date")
+        if date is not None:
+            datetime.strptime(str(date), "%Y-%m-%d")
+    except (ValueError, TypeError) as e:
+        return jsonify(error=f"invalid close: {e}"), 400
+    with _db_lock:
+        pos = _conn.execute("SELECT * FROM positions WHERE id = ?", (pid,)).fetchone()
+        if pos is None:
+            return jsonify(error="no such open position"), 404
+        day = str(date) if date else datetime.now(IST if pos["market"] == "india" else timezone.utc).strftime("%Y-%m-%d")
+        fees = pos["fee_pct"] / 100 * pos["qty"] * (pos["entry"] + price)  # both sides, at their own prices
+        try:
+            cur = _conn.execute(
+                "INSERT INTO trades (date, symbol, side, qty, entry, exit, fees, notes, market, mode) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (day, pos["symbol"], pos["side"], pos["qty"], pos["entry"], price, fees, "Paper trade", pos["market"], pos["mode"]),
+            )
+            _conn.execute("DELETE FROM positions WHERE id = ?", (pid,))
+            _conn.commit()
+        except sqlite3.Error:
+            _conn.rollback()
+            raise
+        trade = _conn.execute("SELECT * FROM trades WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return jsonify(ok=True, trade=_trade_dict(trade))
 
 
 # ----------------------------------------------------------------- static

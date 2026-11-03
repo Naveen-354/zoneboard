@@ -4,13 +4,14 @@ import { Board } from "./board.js";
 import { PriceChart } from "./chart.js";
 import * as view from "./view.js";
 import * as journal from "./journal.js";
+import { initTrading } from "./trading.js";
 import { BinanceSource } from "./feed.js";
 import { createCrypto, info as cryptoInfo } from "./markets/crypto.js";
 import { createIndia, info as indiaInfo } from "./markets/india.js";
 
 // ---------------------------------------------------------------- preferences
 const KEY = "zoneboard.v1";
-const prefs = { market: "crypto", view: "board", sym: {}, tf: {}, boardTf: {}, zones: true, levels: true };
+const prefs = { market: "crypto", mode: "demo", view: "board", sym: {}, tf: {}, boardTf: {}, zones: true, levels: true };
 try {
   Object.assign(prefs, JSON.parse(localStorage.getItem(KEY) || "{}"));
 } catch {
@@ -35,8 +36,20 @@ const board = new Board({
 });
 const chart = new PriceChart($("#chart"), $("#legend"));
 let market = null;
-let config = { demo: false, crypto: { symbols: [] } };
-const demo = () => config.demo || new URLSearchParams(location.search).has("demo");
+let config = { sample: false, crypto: { symbols: [] } };
+let feedState = "connecting"; // the market's connection state, for the order ticket
+// The ACCOUNT (top right). Charts always show real prices: the account only decides what an order is.
+//   "demo" = practice account: simulated orders at the real price on screen, logged in a separate journal.
+//   "live" = real orders. No broker is connected, so this account can't trade yet.
+let mode = "demo";
+// Made-up prices instead of real ones: for development without internet only (SAMPLE_DATA=1 or ?sample).
+// Not part of the Live/Demo toggle, and ordering is switched off while it's on.
+let sample = false;
+
+const trading = initTrading({
+  ctx: () => ({ market, mode, sample, sym: market?.symbol ?? null, feedState }),
+  openSymbol: (sym) => select(sym),
+});
 
 function onSearchEnter(text, firstMatch) {
   if (firstMatch) return select(firstMatch);
@@ -47,8 +60,9 @@ function select(sym) {
   if (!market) return;
   prefs.sym[market.id] = sym;
   save();
-  journal.prefill(sym);
-  return market.open(sym, market.chartTf);
+  const opened = market.open(sym, market.chartTf);
+  trading.render();
+  return opened;
 }
 
 // ---------------------------------------------------------------- connection pill
@@ -59,8 +73,9 @@ function onStatus(s) {
     c.className = "conn " + cls;
     t.textContent = text;
   };
-  if (s.state === "live") set(s.demo ? "demo" : "live", s.demo ? `Demo · simulated · ${s.rate}/s` : `Live · ${s.rate} msg/s`);
-  else if (s.state === "delayed") set("warn", `Delayed 15 min · updated ${(s.updated || "").slice(11, 16)}`);
+  feedState = s.state;
+  if (s.state === "live") set(s.sample ? "sample" : "live", s.sample ? `Sample data · made up · ${s.rate}/s` : `Live · ${s.rate} msg/s`);
+  else if (s.state === "delayed") s.sample ? set("sample", "Sample data · made-up NSE prices") : set("warn", `Delayed 15 min · updated ${(s.updated || "").slice(11, 16)}`);
   else if (s.state === "connecting") set("warn", "Connecting…");
   else if (s.state === "reconnecting") set("warn", "Reconnecting…");
   else if (s.state === "stale") set("warn", "No data, reconnecting…");
@@ -73,7 +88,7 @@ function onError(text) {
     action: {
       label: "Retry",
       run: () => {
-        view.banner(market.note);
+        view.banner(noteFor(market));
         market.reload();
       },
     },
@@ -127,7 +142,10 @@ for (const [id, key] of [["tZones", "zones"], ["tLevels", "levels"]]) {
 }
 chart.showOverlay({ zones: prefs.zones, levels: prefs.levels });
 
-// ---------------------------------------------------------------- market switching
+// ---------------------------------------------------------------- market and account switching
+/** The banner under the header: what to know about this market's data (or that the data is made up). */
+const noteFor = (m) => (sample ? "Sample data is on: every price here is made up. For development only, so ordering is switched off." : m.note);
+
 async function switchMarket(id) {
   market?.stop();
   market = null;
@@ -137,8 +155,9 @@ async function switchMarket(id) {
 
   const info = id === "crypto" ? cryptoInfo : indiaInfo;
   setLocale(info.locale);
-  journal.setMarket(info);
-  view.banner(info.note);
+  journal.setContext(info, mode);
+  view.banner(noteFor(info));
+  trading.reset(); // the previous market's positions are not this market's
   board.setItems([]);
   chart.clear();
   view.setSymbol("Pick a symbol");
@@ -150,13 +169,14 @@ async function switchMarket(id) {
   const opts = { board, chart, onStatus, onError, chartTf: saved(info.chartTfs, "tf"), boardTf: saved(info.boardTfs, "boardTf") };
   let m;
   if (id === "crypto") {
-    const src = demo() ? new (await import("./sim.js")).SimSource() : new BinanceSource(); // the simulator is only fetched in demo mode
+    const src = sample ? new (await import("./sim.js")).SimSource() : new BinanceSource(); // the simulator is only fetched for sample data
     m = createCrypto({ ...opts, src, symbols: config.crypto.symbols });
   } else {
-    m = createIndia(opts);
+    m = createIndia({ ...opts, sample });
   }
   market = m;
   renderTimeframes();
+  trading.refresh();
 
   const started = m.start(); // crypto: starts streaming at once; India: resolves to the strongest setup
   const sym = prefs.sym[id] || (id === "crypto" ? config.crypto.symbols[0] : await started);
@@ -169,6 +189,30 @@ $("#market").addEventListener("click", (e) => {
   if (b && b.dataset.m !== market?.id) switchMarket(b.dataset.m);
 });
 
+/** Live <-> Demo account (top right). */
+function applyMode(next) {
+  mode = next;
+  document.body.classList.toggle("is-demo", mode === "demo");
+  for (const b of $$("#mode button")) b.classList.toggle("on", b.dataset.mode === mode);
+}
+
+// Both accounts see the same real prices, so switching restarts nothing: only the ticket, the open positions and the
+// journal change over.
+$("#mode").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b || b.dataset.mode === mode) return;
+  applyMode(b.dataset.mode);
+  prefs.mode = mode;
+  save();
+  if (!market) return;
+  journal.setContext(market, mode);
+  trading.reset();
+  trading.refresh();
+  if (prefs.view === "journal") journal.load();
+});
+
+$("#goChart").addEventListener("click", () => showView("board"));
+
 // ---------------------------------------------------------------- views
 function showView(v) {
   prefs.view = v;
@@ -176,10 +220,8 @@ function showView(v) {
   $("#boardView").hidden = v !== "board";
   $("#journalView").hidden = v !== "journal";
   for (const b of $$("#tabs button")) b.classList.toggle("on", b.dataset.v === v);
-  if (v === "journal") {
-    journal.prefill(market?.symbol);
-    journal.load();
-  }
+  if (v === "journal") journal.load();
+  else trading.render();
 }
 $("#tabs").addEventListener("click", (e) => {
   const b = e.target.closest("button");
@@ -210,6 +252,12 @@ addEventListener("keydown", (e) => {
     onError(`Can't reach the ZoneBoard server: ${e.message}`);
     return;
   }
+  trading.setFees(config.fees);
+  const params = new URLSearchParams(location.search);
+  // Account: ?live or ?demo in the URL wins, otherwise your last choice, otherwise the practice (demo) account.
+  applyMode(params.has("live") ? "live" : params.has("demo") ? "demo" : prefs.mode === "live" ? "live" : "demo");
+  // Made-up data (development): SAMPLE_DATA=1 on the server or ?sample in the URL; ?sample=0 forces real data.
+  sample = params.get("sample") === "0" ? false : config.sample || params.has("sample");
   showView(prefs.view === "journal" ? "journal" : "board");
   await switchMarket(prefs.market === "india" ? "india" : "crypto");
 })();

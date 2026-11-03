@@ -16,6 +16,8 @@
 <link rel="modulepreload" href="/static/js/chart.js">
 <link rel="modulepreload" href="/static/js/view.js">
 <link rel="modulepreload" href="/static/js/journal.js">
+<link rel="modulepreload" href="/static/js/trading.js">
+<link rel="modulepreload" href="/static/js/hours.js">
 <link rel="modulepreload" href="/static/js/markets/crypto.js">
 <link rel="modulepreload" href="/static/js/markets/india.js">
 <link rel="modulepreload" href="/static/js/feed.js">
@@ -38,6 +40,10 @@
     <button type="button" data-v="journal">Journal</button>
   </div>
   <div class="conn" id="conn"><i class="dot"></i><span id="connText">Connecting…</span></div>
+  <div class="seg mode" id="mode" role="tablist" aria-label="Data mode">
+    <button type="button" data-mode="live" title="Live account: real orders. No broker is connected yet, so it can't trade."><i class="mdot"></i>Live</button>
+    <button type="button" data-mode="demo" class="on" title="Demo account: practise with simulated orders on real prices">Demo</button>
+  </div>
 </header>
 
 <div class="banner" id="banner" hidden></div>
@@ -80,28 +86,51 @@
       </div>
     </div>
     <div class="chips" id="chips"></div>
-    <div class="chart-wrap">
-      <div id="chart"></div>
-      <div class="legend" id="legend"></div>
-      <div class="msg" id="msg"></div>
+    <div class="chart-row">
+      <div class="chart-wrap">
+        <div id="chart"></div>
+        <div class="legend" id="legend"></div>
+        <div class="msg" id="msg"></div>
+      </div>
+
+      <aside class="ticket" id="ticket" aria-label="Paper order ticket">
+        <div class="tk-head"><b>Order ticket</b><span class="tk-badge" id="tkBadge">LIVE PRICES</span></div>
+        <div class="tk-px"><span id="tkSym">–</span><b id="tkPx">–</b></div>
+        <div class="tk-note" id="tkNote"></div>
+        <div class="seg tk-side" id="tkSide" role="tablist" aria-label="Side">
+          <button type="button" data-s="long" class="on buy">Buy</button>
+          <button type="button" data-s="short" class="sell">Sell</button>
+        </div>
+        <label class="tk-field">Quantity<input id="tkQty" type="number" min="0" step="any" inputmode="decimal" placeholder="0" autocomplete="off"></label>
+        <div class="tk-chips" id="tkChips" aria-label="Size by amount"></div>
+        <div class="tk-est" id="tkEst"></div>
+        <button class="tk-go buy" id="tkGo" type="button" disabled>Buy</button>
+        <p class="tk-msg" id="tkMsg" role="status" aria-live="polite"></p>
+        <p class="tk-foot" id="tkFoot">Simulated orders, filled at the price shown. No real money moves.</p>
+      </aside>
     </div>
+
+    <section class="positions" id="positions" aria-label="Open positions">
+      <div class="pos-head">
+        <b>Positions <span id="posCount" class="pos-count"></span></b>
+        <span class="pos-msg" id="posMsg" role="status" aria-live="polite"></span>
+        <span class="pos-total" id="posTotal"></span>
+      </div>
+      <div class="pos-empty" id="posEmpty">No open positions. Place an order from the ticket; closing it logs the trade to the Journal.</div>
+      <div class="pos-wrap" id="posWrap" hidden>
+        <table>
+          <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Last</th><th>P&amp;L</th><th>%</th><th></th></tr></thead>
+          <tbody id="posBody"></tbody>
+        </table>
+      </div>
+    </section>
   </section>
 </main>
 
 <main class="journal" id="journalView" hidden>
-  <div class="banner err" id="jerr" hidden style="margin:0"></div>
-  <div class="card">
-    <form class="j" id="jform">
-      <label>Date<input type="date" name="date" required></label>
-      <label>Symbol<input name="symbol" placeholder="BTCUSDT" required maxlength="20" autocomplete="off"></label>
-      <label>Side<select name="side"><option value="long">Long</option><option value="short">Short</option></select></label>
-      <label>Quantity<input name="qty" type="number" min="0" step="any" placeholder="Qty" required></label>
-      <label>Entry<input name="entry" type="number" min="0" step="any" placeholder="Entry" required></label>
-      <label>Exit<input name="exit" type="number" min="0" step="any" placeholder="Exit" required></label>
-      <label>Fees<input name="fees" type="number" min="0" step="any" placeholder="Fees + taxes"></label>
-      <label>Notes<input name="notes" placeholder="Why, what you felt" maxlength="500"></label>
-      <button class="btn" type="submit">Add trade</button>
-    </form>
+  <div class="jhead">
+    <div><b id="jctx">Journal</b><span id="jsub" class="jsub"></span></div>
+    <button class="btn ghost" id="goChart" type="button">Place an order on the chart</button>
   </div>
   <div class="stats" id="jstats"></div>
   <div class="card table-wrap">
@@ -109,7 +138,7 @@
       <thead><tr><th>Date</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Fees</th><th>P&amp;L</th><th>Notes</th><th></th></tr></thead>
       <tbody id="jbody"></tbody>
     </table>
-    <div class="empty-j" id="jempty" hidden>No trades yet for this market. Add one above.</div>
+    <div class="empty-j" id="jempty" hidden>No closed trades yet. Place an order on the chart screen; when you close the position it is logged here.</div>
   </div>
 </main>
 

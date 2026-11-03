@@ -11,7 +11,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::{FixedOffset, Utc};
@@ -36,20 +36,29 @@ const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsa
 pub struct AppState {
     data: DataStore,
     journal: Journal,
-    scan: Mutex<Option<(Instant, Value)>>,
+    scan: [Mutex<Option<(Instant, Value)>>; 2], // indexed by `sample as usize`: sample and real scans never share a cache
 }
 
 pub type Shared = Arc<AppState>;
 
 impl AppState {
-    pub fn new(demo: bool, journal_path: &str) -> Result<Shared, String> {
+    pub fn new(sample: bool, journal_path: &str) -> Result<Shared, String> {
         let journal = Journal::open(journal_path).map_err(|e| format!("can't open journal {journal_path}: {e}"))?;
-        Ok(Arc::new(Self { data: DataStore::new(demo), journal, scan: Mutex::new(None) }))
+        Ok(Arc::new(Self { data: DataStore::new(sample), journal, scan: [Mutex::new(None), Mutex::new(None)] }))
+    }
+
+    /// `?sample=1` / `?sample=0` on a request; without it the `SAMPLE_DATA=1` environment decides.
+    fn want_sample(&self, q: &HashMap<String, String>) -> bool {
+        match q.get("sample").map(String::as_str) {
+            Some("1" | "true") => true,
+            Some(_) => false,
+            None => self.data.sample,
+        }
     }
 }
 
-pub fn demo_from_env() -> bool {
-    std::env::var("DEMO").as_deref() == Ok("1")
+pub fn sample_from_env() -> bool {
+    std::env::var("SAMPLE_DATA").as_deref() == Ok("1")
 }
 
 fn err(status: StatusCode, msg: &str) -> Response {
@@ -65,6 +74,8 @@ pub fn app(state: Shared) -> Router {
         .route("/api/chart/{symbol}", get(chart))
         .route("/api/journal", get(journal_get).post(journal_add))
         .route("/api/journal/{id}", delete(journal_delete))
+        .route("/api/positions", get(positions_get).post(positions_open))
+        .route("/api/positions/{id}/close", post(positions_close))
         .layer(middleware::from_fn(guard))
         .with_state(state)
 }
@@ -132,9 +143,10 @@ async fn static_file(Path(path): Path<String>, headers: HeaderMap) -> Response {
 // ------------------------------------------------------------------ api
 async fn config(State(s): State<Shared>) -> Json<Value> {
     Json(json!({
-        "demo": s.data.demo,
+        "sample": s.data.sample,
         "crypto": { "symbols": data::load_crypto_symbols() },
         "india": { "count": data::load_symbols().len() },
+        "fees": { "crypto": journal::fee_pct("crypto"), "india": journal::fee_pct("india") },
     }))
 }
 
@@ -145,8 +157,8 @@ struct Row<'a> {
     summary: &'a Summary,
 }
 
-async fn run_scan(s: &AppState) -> Value {
-    let frames = s.data.daily_all().await;
+async fn run_scan(s: &AppState, sample: bool) -> Value {
+    let frames = s.data.daily_all(sample).await;
     let mut rows: Vec<(String, Summary)> = frames.iter().filter(|(_, f)| f.len() >= 40).map(|(sym, f)| (sym.clone(), zones::summary_of(f))).collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -167,7 +179,7 @@ async fn run_scan(s: &AppState) -> Value {
     let ist = FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
     json!({
         "updated": Utc::now().with_timezone(&ist).format("%Y-%m-%d %H:%M:%S IST").to_string(),
-        "demo": s.data.demo,
+        "sample": sample,
         "counts": {
             "total": rows.len(),
             "bullish": count(Label::Bullish),
@@ -182,10 +194,11 @@ async fn run_scan(s: &AppState) -> Value {
     })
 }
 
-async fn scan(State(s): State<Shared>) -> Json<Value> {
-    let mut slot = s.scan.lock().await; // one scan at a time; others wait and share the result
+async fn scan(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+    let sample = s.want_sample(&q);
+    let mut slot = s.scan[sample as usize].lock().await; // one scan at a time per mode; others wait and share the result
     if slot.as_ref().is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(60)) {
-        let v = run_scan(&s).await;
+        let v = run_scan(&s, sample).await;
         *slot = Some((Instant::now(), v));
     }
     Json(slot.as_ref().unwrap().1.clone())
@@ -205,7 +218,7 @@ async fn chart(State(s): State<Shared>, Path(symbol): Path<String>, Query(q): Qu
         let names: Vec<&str> = data::INTERVALS.iter().map(|x| x.0).collect();
         return err(StatusCode::BAD_REQUEST, &format!("interval must be one of {}", names.join(", ")));
     }
-    let Some(f) = s.data.ohlcv(&symbol, interval).await.filter(|f| f.len() >= 40) else {
+    let Some(f) = s.data.ohlcv(&symbol, interval, s.want_sample(&q)).await.filter(|f| f.len() >= 40) else {
         return err(StatusCode::NOT_FOUND, &format!("no data for {symbol} (check the symbol or your connection)"));
     };
     let an = zones::analyze(&f);
@@ -218,19 +231,34 @@ async fn chart(State(s): State<Shared>, Path(symbol): Path<String>, Query(q): Qu
     Json(json!({ "symbol": symbol, "interval": interval, "candles": candles, "zones": zone_out, "levels": level_out, "summary": summary })).into_response()
 }
 
-async fn journal_get(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+/// `?market=` (default india) and `?mode=` (default live), validated.
+fn market_mode(q: &HashMap<String, String>) -> Result<(&str, &str), Response> {
     let market = q.get("market").map_or("india", String::as_str);
-    if !journal::MARKETS.contains(&market) {
-        return err(StatusCode::BAD_REQUEST, &format!("market must be one of {}", journal::MARKETS.join(", ")));
+    let mode = q.get("mode").map_or("live", String::as_str);
+    journal::check_market_mode(market, mode).map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
+    Ok((market, mode))
+}
+
+/// A JSON request body, or Null. JSON only, like Flask's get_json(): a cross-site form post can't send
+/// this content type without a CORS preflight.
+fn json_body(headers: &HeaderMap, body: &[u8]) -> Value {
+    let is_json = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("application/json"));
+    if is_json {
+        serde_json::from_slice(body).unwrap_or(Value::Null)
+    } else {
+        Value::Null
     }
-    Json(s.journal.payload(market)).into_response()
+}
+
+async fn journal_get(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    match market_mode(&q) {
+        Ok((market, mode)) => Json(s.journal.payload(market, mode)).into_response(),
+        Err(r) => r,
+    }
 }
 
 async fn journal_add(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
-    // JSON only, like Flask's get_json(): a cross-site form post can't send this content type without a CORS preflight
-    let is_json = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("application/json"));
-    let parsed: Value = if is_json { serde_json::from_slice(&body).unwrap_or(Value::Null) } else { Value::Null };
-    match s.journal.add(&parsed) {
+    match s.journal.add(&json_body(&headers, &body)) {
         Ok(()) => (StatusCode::CREATED, Json(json!({ "ok": true }))).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, &e),
     }
@@ -239,6 +267,29 @@ async fn journal_add(State(s): State<Shared>, headers: HeaderMap, body: axum::bo
 async fn journal_delete(State(s): State<Shared>, Path(id): Path<i64>) -> Json<Value> {
     s.journal.delete(id);
     Json(json!({ "ok": true }))
+}
+
+// Paper trading: simulated orders at the price the page sends. See journal.rs.
+async fn positions_get(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    match market_mode(&q) {
+        Ok((market, mode)) => Json(json!({ "positions": s.journal.positions(market, mode) })).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn positions_open(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    match s.journal.open_position(&json_body(&headers, &body)) {
+        Ok(p) => (StatusCode::CREATED, Json(json!({ "ok": true, "position": p }))).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+async fn positions_close(State(s): State<Shared>, Path(id): Path<i64>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    match s.journal.close_position(id, &json_body(&headers, &body)) {
+        Ok(t) => Json(json!({ "ok": true, "trade": t })).into_response(),
+        Err(journal::CloseError::NotFound) => err(StatusCode::NOT_FOUND, "no such open position"),
+        Err(journal::CloseError::Invalid(m)) => err(StatusCode::BAD_REQUEST, &m),
+    }
 }
 
 // ------------------------------------------------------------------ serving
@@ -283,7 +334,7 @@ pub async fn serve(listeners: Vec<TcpListener>, state: Shared) -> std::io::Resul
 pub fn spawn() -> Result<u16, String> {
     let listeners = bind().map_err(|e| format!("can't start the local server: {e}"))?;
     let port = port_of(&listeners);
-    let state = AppState::new(demo_from_env(), &journal::default_path())?;
+    let state = AppState::new(sample_from_env(), &journal::default_path())?;
     std::thread::Builder::new()
         .name("zoneboard-server".into())
         .spawn(move || {

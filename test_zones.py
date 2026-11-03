@@ -1,7 +1,7 @@
 """Tests for the zone logic and API. Run:  python -m pytest -q   (or python test_zones.py)"""
 import os
 
-os.environ["DEMO"] = "1"
+os.environ["SAMPLE_DATA"] = "1"
 os.environ.setdefault("JOURNAL_DB", ":memory:")
 
 import numpy as np
@@ -110,7 +110,7 @@ def test_api_endpoints():
 
     client = app_module.app.test_client()
     scan = client.get("/api/scan").get_json()
-    assert scan["demo"] is True and scan["counts"]["total"] > 10
+    assert scan["sample"] is True and scan["counts"]["total"] > 10
     assert all(r["score"] >= 15 for r in scan["bullish"])
     sym = scan["bullish"][0]["symbol"] if scan["bullish"] else "SBIN"
     for interval in ("1d", "1h", "15m"):

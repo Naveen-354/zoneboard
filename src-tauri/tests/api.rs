@@ -35,10 +35,77 @@ async fn get_json(r: &Router, uri: &str) -> (StatusCode, Value) {
 async fn config_lists_crypto_symbols() {
     let (s, c) = get_json(&router(), "/api/config").await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(c["demo"], true);
+    assert_eq!(c["sample"], true); // this test server runs on made-up sample data
     let syms = c["crypto"]["symbols"].as_array().unwrap();
     assert!(syms.iter().any(|x| x == "BTCUSDT") && syms.len() >= 20);
     assert!(c["india"]["count"].as_u64().unwrap() > 10);
+    assert_eq!(c["fees"], json!({"crypto": 0.1, "india": 0.05})); // simulated fee per side, percent
+}
+
+#[tokio::test]
+async fn sample_data_flag_per_request() {
+    // the server default is sample data here; ?sample=1 is explicit. (?sample=0 would fetch real NSE data: not in unit tests.)
+    let r = router();
+    assert_eq!(get_json(&r, "/api/scan").await.1["sample"], true);
+    assert_eq!(get_json(&r, "/api/scan?sample=1").await.1["sample"], true);
+    assert_eq!(get_json(&r, "/api/chart/SBIN?interval=1d&sample=1").await.0, StatusCode::OK);
+}
+
+/// An order on the demo account (paper trading on real prices), with `extra` fields overriding the defaults.
+fn order(extra: Value) -> Value {
+    let mut o = json!({"market": "crypto", "mode": "demo", "symbol": "BTCUSDT", "side": "long", "qty": 0.01, "price": 78000});
+    for (k, v) in extra.as_object().unwrap() {
+        o[k] = v.clone();
+    }
+    o
+}
+
+#[tokio::test]
+async fn paper_positions_open_close_and_reach_the_demo_journal() {
+    let r = router();
+    let (s, _, b) = call(&r, "POST", "/api/positions", "localhost", Some(order(json!({}))), &[]).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let pos: Value = serde_json::from_slice(&b).unwrap();
+    let id = pos["position"]["id"].as_i64().unwrap();
+    assert_eq!(pos["position"]["fee_pct"], 0.1);
+    assert_eq!(pos["position"]["entry"], 78000.0);
+    assert_eq!(pos["position"]["mode"], "demo");
+
+    assert_eq!(get_json(&r, "/api/positions?market=crypto&mode=demo").await.1["positions"].as_array().unwrap().len(), 1);
+
+    let (s, _, b) = call(&r, "POST", &format!("/api/positions/{id}/close"), "localhost", Some(json!({"price": 79000, "date": "2026-11-02"})), &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    let t: Value = serde_json::from_slice(&b).unwrap();
+    let fees = 0.1 / 100.0 * 0.01 * (78000.0 + 79000.0);
+    assert!((t["trade"]["fees"].as_f64().unwrap() - fees).abs() < 1e-9);
+    assert_eq!(t["trade"]["pnl"].as_f64().unwrap(), ((0.01 * 1000.0 - fees) * 100.0).round() / 100.0);
+    assert_eq!((t["trade"]["date"].as_str(), t["trade"]["mode"].as_str()), (Some("2026-11-02"), Some("demo")));
+
+    assert_eq!(call(&r, "POST", &format!("/api/positions/{id}/close"), "localhost", Some(json!({"price": 79000})), &[]).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(get_json(&r, "/api/positions?market=crypto&mode=demo").await.1["positions"].as_array().unwrap().len(), 0);
+    assert_eq!(get_json(&r, "/api/journal?market=crypto&mode=demo").await.1["trades"].as_array().unwrap().len(), 1);
+    assert_eq!(get_json(&r, "/api/journal?market=crypto&mode=live").await.1["trades"].as_array().unwrap().len(), 0); // never touched the live account
+}
+
+#[tokio::test]
+async fn live_account_refuses_orders_and_bad_orders_are_refused() {
+    let r = router();
+    // no broker is connected, so a "live" order would claim a real trade that never happened
+    let (s, _, b) = call(&r, "POST", "/api/positions", "localhost", Some(order(json!({"mode": "live"}))), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&b).contains("live orders"));
+    assert_eq!(get_json(&r, "/api/positions?market=crypto&mode=live").await.1["positions"].as_array().unwrap().len(), 0);
+
+    for bad in [json!({"price": 0}), json!({"price": "nan"}), json!({"qty": 0}), json!({"side": "buy"}), json!({"market": "forex"}), json!({"mode": "paper"}), json!({"symbol": "../etc"}), json!({"market": "india", "qty": 1.5})] {
+        assert_eq!(call(&r, "POST", "/api/positions", "localhost", Some(order(bad.clone())), &[]).await.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert_eq!(get_json(&r, "/api/positions?market=forex").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(get_json(&r, "/api/positions?market=crypto&mode=paper").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(call(&r, "POST", "/api/positions/999999/close", "localhost", Some(json!({"price": 1})), &[]).await.0, StatusCode::NOT_FOUND);
+
+    // like the journal: a body not declared as JSON is refused
+    let req = Request::builder().method("POST").uri("/api/positions").header(header::HOST, "localhost").header(header::CONTENT_TYPE, "text/plain").body(Body::from(order(json!({})).to_string())).unwrap();
+    assert_eq!(r.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -89,7 +156,7 @@ async fn scan_and_chart_shapes_for_the_ui() {
     let r = router();
     let (s, scan) = get_json(&r, "/api/scan").await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(scan["demo"], true);
+    assert_eq!(scan["sample"], true);
     let total = scan["counts"]["total"].as_u64().unwrap();
     assert!(total > 10);
     let all = scan["all"].as_array().unwrap();

@@ -4,7 +4,9 @@ A personal scanner, chart, journal and backtester for **live crypto** and **dela
 
 - **Board:** ranks the watchlist into the strongest bullish and bearish setups, labels weak ones "choppy". Prices tick live.
 - **Chart:** candles, volume, order block zones, swing-high/low liquidity levels, support and resistance. The forming candle moves trade by trade.
-- **Journal:** log trades per market, see net P&L, win rate, profit factor and fees paid.
+- **Paper trading:** an order ticket on the chart screen. Buy or sell at the price on screen, watch the position's P&L move, close it. **Simulated: no broker, no real money.**
+- **Journal:** every closed paper trade is logged automatically, per market, with net P&L, win rate, profit factor and fees paid.
+- **Live / Demo account toggle** (top right): **Demo** is the practice account (simulated orders on real prices). **Live** is the account for real orders, which isn't connected to any broker yet.
 - **Backtest:** test the order block rule on years of history before trusting it.
 
 | Market | Data | Speed |
@@ -45,13 +47,21 @@ pip install -r requirements.txt
 python app.py                     # http://127.0.0.1:5000
 ```
 
-### Demo mode (no internet)
+### Live and Demo accounts
 
-`DEMO=1` uses random synthetic prices for NSE, and the crypto market switches to a simulated feed (a "Demo" badge replaces "Live"). Also `?demo` on the URL for the crypto simulation alone.
+The toggle in the top right is about the **account**, not the data: **the charts always show real prices** in both.
 
-```bash
-set DEMO=1                        # PowerShell: $env:DEMO = "1"
-```
+| | Demo (default) | Live |
+|---|---|---|
+| Prices | real | real |
+| Orders | **simulated**: filled at the price on screen, no broker, no real money | **none yet**: placing real orders needs a connected broker, which this app doesn't have |
+| Journal | your paper trades | trades made through a connected broker (none) |
+
+Switching is instant and keeps both accounts' positions and journals separate. `?demo` or `?live` in the URL picks the account; otherwise the app remembers your last choice (Demo the first time).
+
+### Developing without internet (sample data)
+
+Only for development: `SAMPLE_DATA=1` (PowerShell: `$env:SAMPLE_DATA = "1"`) on the server, or `?sample` in the URL, swaps every price for made-up random ones (`?sample=0` forces real data). It is not part of the Live/Demo toggle, it's labelled everywhere, and **ordering is switched off** so made-up prices can never reach a journal.
 
 ## Using it
 
@@ -64,6 +74,15 @@ set DEMO=1                        # PowerShell: $env:DEMO = "1"
 - **Setups / All:** *Setups* shows the strongest bullish and bearish; *All* lists every symbol with its live price.
 - **Board timeframe:** the board's score is computed on the timeframe you pick (crypto: 15m / 1h / 4h / 1d). 24/7 markets have no "today", so a 1h board stays meaningful at any hour.
 - **Zones / Levels** buttons toggle the overlays. A zone whose impulse candle is still open is drawn dashed and marked *forming*: it can disappear when the candle closes.
+**Paper trading** (chart screen, right of the chart):
+1. Pick a symbol, choose **Buy** or **Sell** (a sell opens a short), enter a quantity or tap an amount chip (100 / 500 / 1k USDT, or ₹10k / ₹50k / ₹1L), press the big button. It fills at the price shown.
+2. The position appears under the chart with its live P&L (after the simulated fees a close would cost). Click its symbol to jump to its chart.
+3. **Close** it: the trade is logged to the **Journal** and the result is shown.
+- Fees are simulated: 0.1% per side for crypto and 0.05% for NSE (the same costs the backtest assumes).
+- Only the **Demo** account can trade; the Live account's ticket is disabled and says why (the server refuses live orders too). Orders are also refused when they'd be unrealistic: crypto needs a live feed, and **NSE needs the market open** (Mon to Fri, 09:15 to 15:30 IST; its price is 15 minutes old, which the ticket says). Outside NSE hours, practise on crypto: it trades 24/7.
+- Open positions are stored by the app, so they survive a reload or restart. NSE quantities must be whole shares.
+- There are no stop-loss or limit orders yet: only market orders you close yourself.
+
 - Your symbol, timeframes and toggles are remembered (per address, so `127.0.0.1:5000` and `localhost:5000` keep separate settings).
 - The watchlists are `symbols_crypto.txt` and `symbols.txt`. The Rust app reads them from the folder you launch it from (or next to the exe); if there is none it uses the copy built into the exe, so after editing the ones in the project folder either launch from there or rebuild.
 
@@ -86,7 +105,7 @@ cargo run --release --bin zoneboard-backtest -- --market crypto --interval 1h # 
 cargo run --release --bin zoneboard-backtest -- --market crypto --interval 15m --bars 20000 --rr 2
 ```
 
-Results are in R (units of risk) before and after costs, split into an older and a newer half. **If the average R is not clearly above zero after costs in both halves, the rule has no usable edge.** On random data (`DEMO=1`) it correctly shows a loss; that is the sanity check you want.
+Results are in R (units of risk) before and after costs, split into an older and a newer half. **If the average R is not clearly above zero after costs in both halves, the rule has no usable edge.** On random sample data (`SAMPLE_DATA=1`) it correctly shows a loss; that is the sanity check you want.
 
 (The Python version still works too: `python backtest.py --period 5y --rr 2 --cost 0.1`, NSE only.)
 
@@ -94,7 +113,7 @@ Results are in R (units of risk) before and after costs, split into an older and
 
 ```bash
 cd src-tauri && cargo test --no-default-features      # Rust: zones, journal, backtest, HTTP API, Python parity
-python -m pytest -q                                   # Python: same checks, plus JS-vs-Python zone parity
+python -m pytest -q                                   # Python: same checks, plus JS-vs-Python zone parity and the UI's market-hours logic
 ```
 
 Three implementations of the zone rules exist (Python, JavaScript for the live chart, Rust). They are kept honest by tests that replay the same bars through each and compare zones, levels, scores and backtest trades.
@@ -130,9 +149,9 @@ Your Fyers app id and secret go in a local, git-ignored `.env` (template: `.env.
 - `symbols.txt` is a starting list of liquid stocks, **not** the official NSE F&O list (which changes). Symbols Yahoo doesn't recognise are skipped.
 - The server has no login and listens on loopback only (`127.0.0.1` and `[::1]`). It refuses requests with any other `Host` header. Don't change that to expose it to a network.
 - The page's Content-Security-Policy only lets it load its own scripts and talk to Binance's public data hosts.
-- Binance's public market-data hosts are reachable from most countries but not all; if the badge never turns "Live", check your connection or VPN, or try `DEMO=1`.
+- Binance's public market-data hosts are reachable from most countries but not all; if the badge never turns "Live", check your connection or VPN, or try `SAMPLE_DATA=1` (made-up prices, for development).
 - The journal is a SQLite file. The Python app uses `journal.db` next to `app.py`. The Rust app uses `JOURNAL_DB` if set, else a `journal.db` in the folder you launch from, else `%APPDATA%\ZoneBoard\journal.db` (so `cargo run` from `src-tauri` starts a fresh journal there, not the project's `journal.db`: launch from the project folder or set `JOURNAL_DB` to keep using that one). Back it up if it matters. Journals from before crypto support open as-is: their trades are filed under India.
-- Crypto journal quantities can be fractional; NSE quantities must be whole numbers. Trades are kept per market so USDT and rupees never mix.
+- Crypto quantities can be fractional; NSE quantities must be whole numbers. Trades are kept per market (USDT and rupees never mix) and per account (Demo-account paper trades never mix with Live-account ones). Orders can't be typed into the Journal any more: trades come from the chart screen. (`POST /api/journal` still exists for scripts.)
 - Educational tool, not investment advice.
 
 ## Layout
@@ -141,8 +160,10 @@ Your Fyers app id and secret go in a local, git-ignored `.env` (template: `.env.
 static/                 the web UI (served by every backend)
   js/zones.js           zone engine (port of zones.py)
   js/feed.js            Binance REST + WebSocket, reconnect, rate-limited subscribes
-  js/sim.js             offline demo feed
+  js/sim.js             made-up sample-data feed (development only)
   js/chart.js           candlestick chart + zone/liquidity overlay (chart library 5.2.1 vendored in vendor/)
+  js/trading.js         paper-trading ticket and open positions (talks to /api/positions)
+  js/hours.js           NSE session hours (tested in Node)
   js/board.js, view.js, journal.js, markets/   board, header, journal, per-market wiring
 src-tauri/              Rust: library + desktop window + server + backtest
   src/zones.rs, data.rs, journal.rs, backtest.rs, server.rs

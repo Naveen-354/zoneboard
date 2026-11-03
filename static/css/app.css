@@ -36,7 +36,7 @@ button{cursor:pointer}
 .conn.live .dot{background:var(--up)}
 .conn.live .dot::after{content:"";position:absolute;inset:0;border-radius:50%;background:var(--up);animation:ring 1.8s ease-out infinite}
 .conn.warn .dot{background:var(--amber)} .conn.bad .dot{background:var(--dn)}
-.conn.demo .dot{background:var(--brand)}
+.conn.sample .dot{background:var(--brand)}
 @keyframes ring{from{transform:scale(1);opacity:.55}to{transform:scale(3);opacity:0}}
 .banner{margin:12px 18px 0;padding:9px 14px;border-radius:10px;background:var(--amber-soft);color:var(--amber);font-size:13px;display:flex;gap:10px;align-items:center}
 .banner.err{background:var(--dn-soft);color:var(--dn)}
@@ -94,7 +94,8 @@ h2{margin:12px 8px 4px;font-size:11px;letter-spacing:.7px;text-transform:upperca
 .chip b{font-weight:650}
 .chip.up{background:var(--up-soft)} .chip.dn{background:var(--dn-soft)}
 .chip.up b{color:var(--up)} .chip.dn b{color:var(--dn)}
-.chart-wrap{position:relative;flex:1;min-height:340px;border-radius:10px;overflow:hidden;border:1px solid var(--line-2)}
+.chart-row{display:flex;gap:12px;flex:1;min-height:300px}
+.chart-wrap{position:relative;flex:1;min-width:0;min-height:300px;border-radius:10px;overflow:hidden;border:1px solid var(--line-2)}
 #chart{position:absolute;inset:0}
 .legend{position:absolute;left:10px;top:8px;z-index:5;display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--mute);pointer-events:none;
   background:rgba(255,255,255,.85);padding:2px 8px;border-radius:7px}
@@ -127,6 +128,71 @@ td button{border:0;background:none;color:var(--faint);font-size:15px;border-radi
 td button:hover{color:var(--dn);background:var(--dn-soft)}
 .empty-j{padding:24px;text-align:center;color:var(--mute)}
 
+/* ---------- live / demo toggle (top right) ---------- */
+.mode button{gap:6px}
+.mdot{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.mode button.on[data-mode=live] .mdot{background:var(--up)}
+.mode button.on[data-mode=demo]{background:var(--brand);color:#fff}
+body.is-demo .top{border-bottom:2px solid var(--brand)}
+
+/* ---------- order ticket (paper trading) ---------- */
+.ticket{width:236px;flex:none;display:flex;flex-direction:column;gap:9px;padding:12px;border:1px solid var(--line-2);border-radius:10px;background:#fff;overflow:auto}
+.tk-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.tk-head b{white-space:nowrap}
+.tk-badge{font-size:10px;font-weight:700;letter-spacing:.4px;padding:2px 7px;border-radius:99px;background:var(--brand-soft);color:var(--brand);white-space:nowrap}
+.tk-badge.off{background:var(--line-2);color:var(--mute)}
+.tk-field input:disabled{background:var(--bg);color:var(--faint);cursor:not-allowed}
+.tk-side button:disabled,.tk-chips button:disabled{opacity:.5;cursor:not-allowed}
+.tk-px{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.tk-px span{color:var(--mute);font-weight:600}
+.tk-px b{font-size:19px;letter-spacing:-.3px;font-variant-numeric:tabular-nums}
+.tk-note{font-size:11.5px;color:var(--amber);min-height:0}
+.tk-note:empty{display:none}
+.tk-side{display:flex}
+.tk-side button{flex:1;justify-content:center}
+.tk-side button.buy.on{background:var(--up);color:#fff}
+.tk-side button.sell.on{background:var(--dn);color:#fff}
+.tk-field{display:grid;gap:4px;font-size:11.5px;color:var(--mute);font-weight:600}
+.tk-field input{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:9px;background:#fff;outline:none;font-size:15px;font-variant-numeric:tabular-nums}
+.tk-field input:focus{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
+.tk-chips{display:flex;gap:6px;flex-wrap:wrap}
+.tk-chips:empty{display:none}
+.tk-chips button{border:1px solid var(--line);background:#fff;color:var(--mute);border-radius:99px;padding:2px 9px;font-size:11.5px;font-weight:600}
+.tk-chips button:hover{border-color:var(--brand);color:var(--brand)}
+.tk-est{font-size:11.5px;color:var(--mute);min-height:15px;font-variant-numeric:tabular-nums}
+.tk-go{border:0;border-radius:10px;padding:10px;font-weight:700;color:#fff}
+.tk-go.buy{background:var(--up)} .tk-go.sell{background:var(--dn)}
+.tk-go:hover:not(:disabled){filter:brightness(1.07)}
+.tk-go:disabled{background:#e4e7ee;color:var(--faint);cursor:not-allowed}
+.tk-msg{margin:0;font-size:12px;min-height:16px;color:var(--mute)}
+.tk-msg.ok{color:var(--up)} .tk-msg.err{color:var(--dn)}
+.tk-foot{margin:0;font-size:11px;color:var(--faint);line-height:1.35}
+
+/* ---------- open positions ---------- */
+.positions{flex:none;border:1px solid var(--line-2);border-radius:10px;background:#fff}
+.pos-head{display:flex;align-items:center;gap:12px;padding:8px 12px;font-size:13px}
+.pos-count{color:var(--faint);font-weight:600}
+.pos-msg{flex:1;min-width:0;font-size:12px;color:var(--mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pos-msg.ok{color:var(--up)} .pos-msg.err{color:var(--dn)}
+.pos-total{font-size:12.5px;font-weight:650;font-variant-numeric:tabular-nums}
+.pos-empty{padding:2px 12px 10px;font-size:12.5px;color:var(--mute)}
+.pos-wrap{max-height:150px;overflow:auto;border-top:1px solid var(--line-2)}
+.pos-wrap table{font-size:12.5px}
+.pos-wrap th,.pos-wrap td{padding:6px 10px}
+.pos-wrap tr.click{cursor:pointer}
+.pos-wrap tr.click:hover{background:var(--bg)}
+.side-tag{font-size:10.5px;font-weight:700;padding:1px 7px;border-radius:99px}
+.side-tag.long{background:var(--up-soft);color:var(--up)} .side-tag.short{background:var(--dn-soft);color:var(--dn)}
+.pos-close{border:1px solid var(--line);background:#fff;border-radius:7px;padding:2px 10px;font-weight:600;color:var(--ink-2)}
+.pos-close:hover:not(:disabled){border-color:var(--dn);color:var(--dn)}
+.pos-close:disabled{opacity:.45;cursor:not-allowed}
+
+/* ---------- journal header ---------- */
+.jhead{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.jsub{margin-left:8px;color:var(--mute);font-size:12.5px}
+.btn.ghost{background:#fff;color:var(--brand);border:1px solid var(--line);box-shadow:none}
+.btn.ghost:hover{border-color:var(--brand);filter:none}
+
 footer{padding:8px 18px 12px;color:var(--faint);font-size:11.5px}
 
 @media(max-width:900px){
@@ -134,7 +200,9 @@ footer{padding:8px 18px 12px;color:var(--faint);font-size:11.5px}
   html{height:auto}
   .layout{grid-template-columns:1fr;padding:12px}
   .board{max-height:46vh}
-  .chart-wrap{min-height:420px}
+  .chart-row{flex-direction:column;flex:none}
+  .chart-wrap{min-height:420px;flex:none}
+  .ticket{width:auto}
   .conn{margin-left:0}
   .top{padding:10px 12px}
 }

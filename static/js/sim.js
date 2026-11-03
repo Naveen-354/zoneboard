@@ -1,4 +1,4 @@
-// Offline stand-in for BinanceSource (random-walk prices, no network). Used with DEMO=1 or ?demo=1,
+// Offline stand-in for BinanceSource (random-walk prices, no network). Used with SAMPLE_DATA=1 or ?sample,
 // for trying the UI without internet. Same interface and the same message shapes as the real feed.
 // Prices here are made up and mean nothing.
 import { TF } from "./feed.js";
@@ -29,7 +29,7 @@ export class SimSource {
     this.r = rng(Date.now());
     this.timer = setInterval(() => this._step(), STEP_MS);
     this.statusTimer = setInterval(() => {
-      const st = { state: "live", rate: this.msgs, lag: 0, demo: true };
+      const st = { state: "live", rate: this.msgs, lag: 0, sample: true };
       this.msgs = 0;
       for (const cb of this.statusCbs) cb(st);
     }, 1000);
@@ -37,7 +37,7 @@ export class SimSource {
 
   onStatus(cb) {
     this.statusCbs.add(cb);
-    cb({ state: "live", rate: 0, lag: 0, demo: true });
+    cb({ state: "live", rate: 0, lag: 0, sample: true });
     return () => this.statusCbs.delete(cb);
   }
 

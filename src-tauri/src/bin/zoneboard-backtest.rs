@@ -3,7 +3,7 @@
 //!   zoneboard-backtest                                       NSE daily, 5 years, 0.1% round-trip cost
 //!   zoneboard-backtest --market crypto --interval 1h         Binance 1h candles (5000 bars each), 0.2% cost
 //!   zoneboard-backtest --market crypto --interval 15m --bars 20000 --rr 2
-//!   DEMO=1 zoneboard-backtest                                random-walk data: should show NO edge
+//!   SAMPLE_DATA=1 zoneboard-backtest                          random-walk sample data: should show NO edge
 //!
 //! Results are in R (units of risk), before and after costs, split into an older and a newer half. If
 //! the average R is not clearly above zero after costs in BOTH halves, the rule has no usable edge.
@@ -67,7 +67,7 @@ async fn main() {
             std::process::exit(if m.is_empty() { 0 } else { 2 });
         }
     };
-    let demo = zoneboard::server::demo_from_env();
+    let sample = zoneboard::server::sample_from_env();
     let client = data::http_client();
 
     let frames: BTreeMap<String, Frame> = if args.market == "crypto" {
@@ -76,7 +76,7 @@ async fn main() {
         stream::iter(data::load_crypto_symbols())
             .map(|s| {
                 let client = client.clone();
-                async move { (s.clone(), if demo { Ok(data::synthetic(&s, "1d")) } else { data::binance_frame(&client, &s, interval, args.bars).await }) }
+                async move { (s.clone(), if sample { Ok(data::synthetic(&s, "1d")) } else { data::binance_frame(&client, &s, interval, args.bars).await }) }
             })
             .buffer_unordered(4)
             .filter_map(|(s, r)| async move {
@@ -96,7 +96,7 @@ async fn main() {
         stream::iter(data::load_symbols())
             .map(|s| {
                 let (client, period) = (client.clone(), args.period.clone());
-                async move { (s.clone(), if demo { Some(data::synthetic(&s, "1d")) } else { data::yahoo_frame(&client, &s, &period, "1d").await }) }
+                async move { (s.clone(), if sample { Some(data::synthetic(&s, "1d")) } else { data::yahoo_frame(&client, &s, &period, "1d").await }) }
             })
             .buffer_unordered(8)
             .filter_map(|(s, f)| async move { f.filter(|f| f.len() > 60).map(|f| (s, f)) })
@@ -105,7 +105,7 @@ async fn main() {
     };
 
     let cost = args.cost.unwrap_or(if args.market == "crypto" { 0.2 } else { 0.1 });
-    println!("Loaded {} symbols{}; reward:risk {}, round-trip cost {}%\n", frames.len(), if demo { " (DEMO random data)" } else { "" }, args.rr, cost);
+    println!("Loaded {} symbols{}; reward:risk {}, round-trip cost {}%\n", frames.len(), if sample { " (SAMPLE random data)" } else { "" }, args.rr, cost);
     let report = backtest::run(&frames, args.rr, cost / 100.0);
     if report.is_empty() {
         println!("No trades found.");

@@ -4,7 +4,7 @@
 //!   Live NSE data needs a broker feed (Fyers or Zerodha Kite); it would slot in next to `yahoo_frame`.
 //! * Crypto candles for the backtest: Binance public market data (no key). The live crypto board does
 //!   not come through here: the browser talks to Binance directly.
-//! * `DEMO=1`: deterministic synthetic bars, no network.
+//! * `SAMPLE_DATA=1`: deterministic synthetic bars, no network.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -147,8 +147,8 @@ pub async fn binance_frame(client: &Client, sym: &str, interval: &str, bars: usi
     Ok(f)
 }
 
-// ------------------------------------------------------------------ demo data
-/// Deterministic random-walk bars for `DEMO=1`. Prices are made up and mean nothing.
+// ------------------------------------------------------------------ sample data
+/// Deterministic random-walk bars for `SAMPLE_DATA=1`. Prices are made up and mean nothing.
 pub fn synthetic(sym: &str, interval: &str) -> Frame {
     let mut seed = fnv(&format!("{sym}{interval}")) | 1;
     let mut rnd = move || {
@@ -204,44 +204,47 @@ fn fnv(s: &str) -> u64 {
 }
 
 // ------------------------------------------------------------------ cached store
-type OneCache = HashMap<(String, String), (Instant, Option<Arc<Frame>>)>;
+/// (symbol, interval, sample) -> bars. Sample and real data are cached apart so they never mix.
+type OneCache = HashMap<(String, String, bool), (Instant, Option<Arc<Frame>>)>;
+type AllCache = Option<(Instant, Arc<HashMap<String, Arc<Frame>>>)>;
 
 pub struct DataStore {
     client: Client,
-    pub demo: bool,
+    /// The server's default (the `SAMPLE_DATA=1` environment). Each request can still pick its own mode.
+    pub sample: bool,
     one: Mutex<OneCache>,
-    all: Mutex<Option<(Instant, Arc<HashMap<String, Arc<Frame>>>)>>,
+    all: [Mutex<AllCache>; 2], // indexed by `sample as usize`
 }
 
 impl DataStore {
-    pub fn new(demo: bool) -> Self {
-        Self { client: http_client(), demo, one: Mutex::new(HashMap::new()), all: Mutex::new(None) }
+    pub fn new(sample: bool) -> Self {
+        Self { client: http_client(), sample, one: Mutex::new(HashMap::new()), all: [Mutex::new(None), Mutex::new(None)] }
     }
 
-    /// Bars for one NSE symbol at 1d / 1h / 15m, cached for a few minutes.
-    pub async fn ohlcv(&self, sym: &str, interval: &str) -> Option<Arc<Frame>> {
+    /// Bars for one NSE symbol at 1d / 1h / 15m, cached for a few minutes. `sample` = synthetic bars.
+    pub async fn ohlcv(&self, sym: &str, interval: &str, sample: bool) -> Option<Arc<Frame>> {
         let &(_, range, ttl) = INTERVALS.iter().find(|x| x.0 == interval)?;
-        let key = (sym.to_string(), interval.to_string());
+        let key = (sym.to_string(), interval.to_string(), sample);
         if let Some((t, v)) = self.one.lock().await.get(&key) {
             if t.elapsed() < Duration::from_secs(ttl) {
                 return v.clone();
             }
         }
-        let frame = if self.demo { Some(synthetic(sym, interval)) } else { yahoo_frame(&self.client, sym, range, interval).await };
+        let frame = if sample { Some(synthetic(sym, interval)) } else { yahoo_frame(&self.client, sym, range, interval).await };
         let frame = frame.map(Arc::new);
         self.one.lock().await.insert(key, (Instant::now(), frame.clone()));
         frame
     }
 
     /// Daily bars for the whole scan list, fetched 8 at a time and cached for 5 minutes.
-    pub async fn daily_all(&self) -> Arc<HashMap<String, Arc<Frame>>> {
-        let mut slot = self.all.lock().await; // held across the fetch so concurrent callers share one scan
+    pub async fn daily_all(&self, sample: bool) -> Arc<HashMap<String, Arc<Frame>>> {
+        let mut slot = self.all[sample as usize].lock().await; // held across the fetch so concurrent callers share one scan
         if let Some((t, v)) = slot.as_ref() {
             if t.elapsed() < Duration::from_secs(300) {
                 return v.clone();
             }
         }
-        let out: HashMap<String, Arc<Frame>> = if self.demo {
+        let out: HashMap<String, Arc<Frame>> = if sample {
             load_symbols().into_iter().map(|s| (s.clone(), Arc::new(synthetic(&s, "1d")))).collect()
         } else {
             stream::iter(load_symbols())

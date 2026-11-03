@@ -177,6 +177,9 @@ Read AGENTS.md and docs/fyers/SPEC.md. This is stage S6: browser changes only.
   pill states: Live NSE / Delayed 15 min / Market closed / Session expired. A "Connect Fyers" button
   (opens the login URL in the system browser; paste fallback if needed) and a setup hint when not
   configured. Debounce chart opens (~150 ms) for NSE.
+- The paper-trading ticket (static/js/trading.js) relies on each market module's quote(sym) and
+  watch(symbols), and gates NSE orders on static/js/hours.js. Live NSE must feed quote() and keep that
+  gate working: don't break them. The Live/Demo toggle is the ACCOUNT (Demo = paper orders on real prices, Live = real orders, none connected); it must keep working for NSE, and live NSE prices go through the same real-data path.
 - Keep the UI light and fast: no framework, no extra requests on the load path, textContent only.
 Verify in a real browser (screenshots of each state). Run all checks. Stop for review.
 ```

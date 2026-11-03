@@ -25,9 +25,12 @@ export const info = {
   note: null,
 };
 
+/** Rough price decimals from magnitude, until real ones are known from the candles. */
+const guessDp = (p) => (p >= 1000 ? 2 : p >= 10 ? 3 : p >= 1 ? 4 : 8);
+
 export const splitSymbol = (sym) => (sym.endsWith("USDT") ? { sym, base: sym.slice(0, -4), quote: "USDT" } : { sym, base: sym, quote: "" });
 
-/** `src` is a BinanceSource, or a SimSource in demo mode (see feed.js / sim.js). */
+/** `src` is a BinanceSource, or a SimSource for sample data (see feed.js / sim.js). */
 export function createCrypto({ src, symbols, board, chart, onStatus, onError, chartTf: initialChartTf, boardTf: initialBoardTf }) {
   const offStatus = src.onStatus(onStatus);
 
@@ -40,6 +43,7 @@ export function createCrypto({ src, symbols, board, chart, onStatus, onError, ch
 
   let cur = null; // open chart: {sym, tf, frame, dp, subs[]}
   let chartToken = 0;
+  const watched = new Map(); // sym -> {price, dp, off}: open positions on coins that are neither charted nor on the board
   let chartTf = initialChartTf || info.defaultChartTf;
 
   // ------------------------------------------------------------------ board
@@ -109,7 +113,7 @@ export function createCrypto({ src, symbols, board, chart, onStatus, onError, ch
           if (!it) continue;
           if (it.price == null) {
             it.price = r.last;
-            it.dp = r.last >= 1000 ? 2 : r.last >= 10 ? 3 : r.last >= 1 ? 4 : 8; // refined when the bars load
+            it.dp = guessDp(r.last); // refined when the bars load
           }
           if (it.chg24 == null) it.chg24 = (r.last / r.open - 1) * 100;
           board.touch(it);
@@ -229,9 +233,40 @@ export function createCrypto({ src, symbols, board, chart, onStatus, onError, ch
     }
   }
 
+  /** Last known price and its decimals for the order ticket and the positions list, or null. */
+  function quote(sym) {
+    if (cur && cur.sym === sym) return { price: cur.frame.c[cur.frame.c.length - 1], dp: cur.dp };
+    const it = board.item(sym);
+    if (it && it.price != null) return { price: it.price, dp: it.dp };
+    const w = watched.get(sym);
+    return w && w.price != null ? { price: w.price, dp: w.dp } : null;
+  }
+
+  /** Keep a ticker stream open for these symbols if nothing else already streams them. */
+  function watch(symbols) {
+    const want = new Set(symbols.filter((s) => !board.item(s)));
+    for (const [s, w] of watched) {
+      if (!want.has(s)) {
+        w.off();
+        watched.delete(s);
+      }
+    }
+    for (const s of want) {
+      if (watched.has(s)) continue;
+      const w = { price: null, dp: 2, off: null };
+      w.off = src.subscribe(stream.ticker(s), (d) => {
+        w.price = +d.c;
+        w.dp = guessDp(w.price);
+      });
+      watched.set(s, w);
+    }
+  }
+
   return {
     ...info,
     src,
+    quote,
+    watch,
     get chartTf() { return chartTf; },
     get boardTf() { return boardTf; },
     get symbol() { return cur?.sym ?? null; },
@@ -251,6 +286,7 @@ export function createCrypto({ src, symbols, board, chart, onStatus, onError, ch
     },
     stop() {
       closeChart();
+      watch([]);
       for (const off of [...subs, ...boardSubs]) off();
       subs.length = 0;
       boardSubs = [];

@@ -11,7 +11,7 @@ Rule (long side; short side is the mirror image):
   * A round-trip cost (brokerage, taxes, slippage) is charged in R terms.
 
 Usage:  python backtest.py [--period 5y] [--rr 2] [--cost 0.1]
-        DEMO=1 python backtest.py      # random-walk data, should show NO edge
+        SAMPLE_DATA=1 python backtest.py   # random-walk sample data, should show NO edge
 """
 from __future__ import annotations
 
@@ -138,7 +138,7 @@ def main():
     args = p.parse_args()
 
     frames = data.daily_all(period=args.period)
-    print(f"Loaded {len(frames)} symbols{' (DEMO random data)' if data.DEMO else ''}")
+    print(f"Loaded {len(frames)} symbols{' (SAMPLE random data)' if data.SAMPLE else ''}")
     trades, report = run(frames, args.rr, args.cost / 100)
     if not report:
         print("No trades found.")

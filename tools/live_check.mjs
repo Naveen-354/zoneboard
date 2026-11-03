@@ -34,7 +34,7 @@ try {
   check("WebSocket: trades arriving", ticks > 0, `(${ticks} in 8 s)`);
   check("WebSocket: candle updates arriving", klines > 0, `(${klines} in 8 s)`);
 } catch (e) {
-  check("Binance reachable", false, `(${e.message}). Check your connection or VPN; the app still runs with DEMO=1.`);
+  check("Binance reachable", false, `(${e.message}). Check your connection or VPN; the app still runs with SAMPLE_DATA=1 (made-up prices, for development).`);
 }
 src.dispose();
 console.log(failed ? "\nSomething is not working: see FAIL above." : "\nAll good: live crypto data works from this machine.");

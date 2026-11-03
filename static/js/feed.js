@@ -141,7 +141,7 @@ export class BinanceSource {
   }
 
   _status(rate = 0) {
-    return { state: this.state, rate, lag: this.lag, demo: false };
+    return { state: this.state, rate, lag: this.lag, sample: false };
   }
 
   _setState(s) {

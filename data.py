@@ -4,7 +4,7 @@ Important:
   * Data is unofficial and delayed (often ~15 minutes). Fine for learning and
     backtesting, not for live execution.
   * Yahoo's terms limit it to personal, non-commercial use.
-  * Set DEMO=1 to use synthetic random data (no network, for testing the app).
+  * Set SAMPLE_DATA=1 to use made-up random sample data (no network; for development and tests only).
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DEMO = os.environ.get("DEMO") == "1"
+SAMPLE = os.environ.get("SAMPLE_DATA") == "1"
 HERE = Path(__file__).parent
 IST = "Asia/Kolkata"
 
@@ -58,7 +58,7 @@ def yf_ticker(sym: str) -> str:
 def epoch_seconds(index: pd.DatetimeIndex) -> np.ndarray:
     """Bar times as true unix seconds (UTC). The browser shows them in the viewer's own time zone.
 
-    Naive timestamps (the synthetic demo data) are taken to be India time.
+    Naive timestamps (the synthetic sample data) are taken to be India time.
     """
     idx = pd.DatetimeIndex(index)
     idx = idx.tz_localize(IST) if idx.tz is None else idx
@@ -98,16 +98,18 @@ def _synthetic(sym: str, interval: str) -> pd.DataFrame:
     return pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume}, index=idx)
 
 
-def get_ohlcv(sym: str, interval: str = "1d") -> pd.DataFrame | None:
+def get_ohlcv(sym: str, interval: str = "1d", sample: bool | None = None) -> pd.DataFrame | None:
+    """Bars for one symbol. `sample` picks synthetic data for this call; None follows the SAMPLE_DATA=1 environment."""
     if interval not in INTERVALS:
         raise ValueError("bad interval")
-    key = ("one", sym, interval)
+    sample = SAMPLE if sample is None else sample
+    key = ("one", sym, interval, sample)
     ttl = INTERVALS[interval][1]
     with _lock:
         hit = _cache.get(key)
         if hit and time.time() - hit[0] < ttl:
             return hit[1]
-    if DEMO:
+    if sample:
         df = _synthetic(sym, interval)
     else:
         import yfinance as yf
@@ -123,16 +125,17 @@ def get_ohlcv(sym: str, interval: str = "1d") -> pd.DataFrame | None:
     return df
 
 
-def daily_all(symbols: list[str] | None = None, period: str = "1y") -> dict[str, pd.DataFrame]:
+def daily_all(symbols: list[str] | None = None, period: str = "1y", sample: bool | None = None) -> dict[str, pd.DataFrame]:
     """Daily bars for many symbols in one request."""
     symbols = symbols or load_symbols()
-    key = ("all", period, tuple(symbols))
+    sample = SAMPLE if sample is None else sample
+    key = ("all", period, tuple(symbols), sample)
     with _lock:
         hit = _cache.get(key)
         if hit and time.time() - hit[0] < 300:
             return hit[1]
     out: dict[str, pd.DataFrame] = {}
-    if DEMO:
+    if sample:
         for s in symbols:
             out[s] = _synthetic(s, "1d")
     else:

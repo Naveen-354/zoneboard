@@ -1,10 +1,10 @@
-// Trade journal tab: log trades, see P&L stats. Trades are kept per market so USDT and rupees never mix.
-import { $, el, fmt, fmtAuto, signed, api } from "./util.js";
+// Journal tab: the history of closed paper trades and their stats. Trades are made on the chart screen (see
+// trading.js) and logged here when a position is closed. They're kept per market, and per mode (live-price or
+// demo) so USDT and rupees never mix and practice trades never pollute real-price ones.
+import { $, el, fmt, fmtAuto, fmtQty, signed, api } from "./util.js";
 
-const form = $("#jform");
 let market = null;
-
-const today = () => new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD in local time
+let mode = "live";
 
 function stat(box, label, value, cls) {
   const s = el("div", "stat");
@@ -12,15 +12,34 @@ function stat(box, label, value, cls) {
   box.append(s);
 }
 
+/** Which journal is showing: set when the market or the Live/Demo mode changes. */
+export function setContext(m, md) {
+  market = m;
+  mode = md;
+  $("#jctx").textContent = `${m.label} journal`;
+  $("#jsub").textContent =
+    md === "live"
+      ? "Live account: trades made through a connected broker (none connected yet)"
+      : m.id === "india"
+        ? "Demo account: paper trades at real NSE prices (about 15 min old)"
+        : "Demo account: paper trades at real prices";
+  $("#jempty").textContent =
+    md === "live"
+      ? "No live-account trades. Live trading isn't connected yet; your practice trades are in the Demo account."
+      : "No closed trades yet. Place an order on the chart screen; when you close the position it is logged here.";
+}
+
 export async function load() {
   if (!market) return;
-  const d = await api("/api/journal?market=" + market.id);
+  const m = market;
+  const md = mode;
+  const d = await api(`/api/journal?market=${m.id}&mode=${md}`);
+  if (m !== market || md !== mode) return; // switched while loading
   const s = d.stats;
-  const cur = market.currency;
   const box = $("#jstats");
   box.replaceChildren();
-  stat(box, "Trades", String(s.trades));
-  stat(box, `Net P&L (${cur})`, signed(s.net_pnl), s.net_pnl >= 0 ? "up" : "dn");
+  stat(box, "Closed trades", String(s.trades));
+  stat(box, `Net P&L (${m.currency})`, signed(s.net_pnl), s.net_pnl >= 0 ? "up" : "dn");
   stat(box, "Win rate", s.win_rate + "%");
   stat(box, "Avg win", fmt(s.avg_win));
   stat(box, "Avg loss", fmt(s.avg_loss));
@@ -32,15 +51,15 @@ export async function load() {
   $("#jempty").hidden = d.trades.length > 0;
   for (const t of d.trades) {
     const tr = el("tr");
-    for (const v of [t.date, t.symbol, t.side, +t.qty.toFixed(8), fmtAuto(t.entry), fmtAuto(t.exit), fmt(t.fees)]) tr.append(el("td", null, String(v)));
+    for (const v of [t.date, t.symbol, t.side, fmtQty(t.qty), fmtAuto(t.entry), fmtAuto(t.exit), fmt(t.fees)]) tr.append(el("td", null, String(v)));
     tr.append(el("td", t.pnl >= 0 ? "up" : "dn", signed(t.pnl)));
     tr.append(el("td", "notes", t.notes));
     const td = el("td");
     const b = el("button", null, "✕");
     b.type = "button";
-    b.title = "Delete trade";
+    b.title = "Delete this trade from the journal";
     b.addEventListener("click", async () => {
-      if (!confirm("Delete this trade?")) return;
+      if (!confirm("Delete this trade from the journal?")) return;
       await api("/api/journal/" + t.id, { method: "DELETE" });
       load();
     });
@@ -49,35 +68,3 @@ export async function load() {
     tb.append(tr);
   }
 }
-
-/** Called when the market switches: trades are filtered per market and the symbol hint changes. */
-export function setMarket(m) {
-  market = m;
-  form.symbol.placeholder = m.id === "crypto" ? "BTCUSDT" : "RELIANCE";
-  form.qty.step = m.id === "crypto" ? "any" : "1";
-  form.qty.min = m.id === "crypto" ? "0" : "1";
-  form.fees.placeholder = `Fees + taxes (${m.currency})`;
-}
-
-/** Suggest the symbol that is open on the chart. */
-export function prefill(sym) {
-  if (sym && !form.symbol.value) form.symbol.value = sym;
-}
-
-form.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const f = Object.fromEntries(new FormData(form));
-  try {
-    await api("/api/journal", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...f, market: market.id }) });
-    $("#jerr").hidden = true;
-    const date = form.date.value;
-    form.reset();
-    form.date.value = date;
-    load();
-  } catch (err) {
-    $("#jerr").textContent = err.message;
-    $("#jerr").hidden = false;
-  }
-});
-
-form.date.value = today();
