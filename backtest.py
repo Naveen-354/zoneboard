@@ -1,4 +1,8 @@
-"""Backtest a simple order-block retest rule on daily data.
+"""FROZEN (T009, decision D4): legacy Python backend, kept as the reference for the zone/backtest
+rules and the parity fixture (backtest reference). New features go to the Rust app only; change this
+file only to keep the parity fixture and existing tests green. See AGENTS.md.
+
+Backtest a simple order-block retest rule on daily data.
 
 Rule (long side; short side is the mirror image):
   * A bullish order block is confirmed on bar `confirm_idx`.

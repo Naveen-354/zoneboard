@@ -37,6 +37,7 @@ tools/                  small dev scripts
 docs/                   specs and guides
 ```
 
+- **Python is frozen** (decision D4, task T009). `app.py`, `data.py`, `backtest.py` and `zones.py` get no new endpoints or features. Change them only to keep the parity fixture and the existing tests green. If the UI starts depending on a Rust-only feature (accounts, tokens), the Python server is allowed not to support it; the README says so.
 - **If you change zone or backtest rules**, change all three engines, regenerate the fixture (`python src-tauri/tests/make_fixture.py`), and keep every parity test passing. Never loosen a parity test to make it pass.
 - `static/vendor/` is a vendored third-party build (chart library, with its licence). Don't edit it.
 - `journal.db` is the owner's real data. **Never** open it in tests or scripts. Tests use `:memory:` or a temp file.

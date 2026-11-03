@@ -1,4 +1,8 @@
-"""ZoneBoard: a personal F&O scanner + chart + journal using free, delayed data.
+"""FROZEN (T009, decision D4): legacy Python backend, kept as the reference for the zone/backtest
+rules and the parity fixture (Python server). New features go to the Rust app only; change this
+file only to keep the parity fixture and existing tests green. See AGENTS.md.
+
+ZoneBoard: a personal F&O scanner + chart + journal using free, delayed data.
 
 Run:  python app.py       then open http://127.0.0.1:5000
 Sample data: SAMPLE_DATA=1 python app.py   (made-up prices for development; no internet needed)

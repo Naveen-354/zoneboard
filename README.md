@@ -38,7 +38,7 @@ cd src-tauri
 cargo run --release --no-default-features --bin zoneboard-server     # then open http://127.0.0.1:5000
 ```
 
-Or the original Python server, which serves the same UI and the same `/api`:
+**Legacy: the Python server.** It is frozen (decision D4, task T009): the Rust app is the product, and the Python code is kept only as the reference for the zone and backtest rules and for the parity fixture. It gets no new features, and it does **not** support Rust-only features (accounts, API token, vault, audit and settings), so parts of the UI may not work against it. It still serves the UI and the older `/api`, and still runs:
 
 ```bash
 python -m venv .venv
@@ -107,7 +107,7 @@ cargo run --release --bin zoneboard-backtest -- --market crypto --interval 15m -
 
 Results are in R (units of risk) before and after costs, split into an older and a newer half. **If the average R is not clearly above zero after costs in both halves, the rule has no usable edge.** On random sample data (`SAMPLE_DATA=1`) it correctly shows a loss; that is the sanity check you want.
 
-(The Python version still works too: `python backtest.py --period 5y --rr 2 --cost 0.1`, NSE only.)
+(The legacy Python version still works too, but is frozen: `python backtest.py --period 5y --rr 2 --cost 0.1`, NSE only.)
 
 ## Tests
 
@@ -168,6 +168,6 @@ static/                 the web UI (served by every backend)
 src-tauri/              Rust: library + desktop window + server + backtest
   src/zones.rs, data.rs, journal.rs, backtest.rs, server.rs
   tests/                parity with Python (fixture from tests/make_fixture.py), HTTP API
-app.py, data.py, zones.py, backtest.py    the original Python backend (kept as the reference)
+app.py, data.py, zones.py, backtest.py    the original Python backend (FROZEN legacy; kept as the reference)
 tools/live_check.mjs    one-command check that live Binance data works from this machine
 ```
