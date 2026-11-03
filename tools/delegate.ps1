@@ -17,7 +17,8 @@ param(
   [ValidateSet('plan', 'accept-edits')][string]$Mode = 'plan',
   [ValidateSet('low', 'medium', 'high', 'xhigh', 'max')][string]$Effort = 'high',
   [switch]$NoSandbox,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [string]$Followup # path to a text file of review corrections: re-run in the existing worktree, apply only those
 )
 $ErrorActionPreference = 'Continue' # native stderr (git progress, agy output) must not abort: exit codes are checked explicitly
 
@@ -45,6 +46,13 @@ $what = if ($Mode -eq 'plan') {
   "PLAN ONLY. Do not edit any file and do not run commands that change anything. Write a concrete implementation plan: files to create or change, order of work, tests to add, risks, and every question you have. Quote the spec's acceptance criteria and say how each will be met."
 } else {
   "IMPLEMENT the task. Follow the spec's scope exactly and touch only what it lists (explain any other file you must change). Run the three checks from AGENTS.md, fix failures, then commit on this branch with a message starting '${Task}:'. Never run git push."
+}
+if ($Followup) {
+  if ($Mode -ne 'accept-edits') { throw "-Followup needs -Mode accept-edits." }
+  if (-not (Test-Path $wt)) { throw "-Followup re-runs in the existing worktree $wt, which does not exist." }
+  if (-not (Test-Path $Followup)) { throw "Followup file not found: $Followup" }
+  $fixes = (Get-Content -Raw -Encoding UTF8 $Followup).Trim()
+  $what = "CORRECTIONS ROUND. The task is already implemented on this branch: read 'git log' and the diff against main first, and do not redo or restructure it. Apply ONLY the corrections below and add the tests they ask for. Run the three checks from AGENTS.md, fix failures, then commit as a NEW commit (do not amend) with a message starting '${Task}:'. Never run git push. In your report list each correction and how you verified it.`n`nCorrections from the reviewer:`n$fixes"
 }
 $prompt = @"
 You are working on task $Task in this git worktree (branch $branch). Read AGENTS.md, docs/platform/WORKFLOW.md and the task spec $specRel completely first.
