@@ -36,12 +36,16 @@
     <button type="button" data-m="crypto" class="on">Crypto <em class="tag live">LIVE</em></button>
     <button type="button" data-m="india">India NSE <em class="tag delay">15m delay</em></button>
   </div>
-  <div class="seg" id="tabs" role="tablist" aria-label="View">
-    <button type="button" data-v="board" class="on">Board</button>
+  <nav class="seg" id="tabs" aria-label="Pages">
+    <button type="button" data-v="board" class="on" aria-current="page">Board</button>
+    <button type="button" data-v="orders">Orders</button>
+    <button type="button" data-v="accounts">Accounts</button>
     <button type="button" data-v="journal">Journal</button>
-  </div>
+    <button type="button" data-v="settings">Settings</button>
+  </nav>
   <div class="conn" id="conn"><i class="dot"></i><span id="connText">Connecting…</span></div>
-  <div class="seg mode" id="mode" role="tablist" aria-label="Data mode">
+  <span class="acct-chip" id="acctChip" title="The account orders go to"></span>
+  <div class="seg mode" id="mode" role="tablist" aria-label="Account">
     <button type="button" data-mode="live" title="Live account: real orders. No broker is connected yet, so it can't trade."><i class="mdot"></i>Live</button>
     <button type="button" data-mode="demo" class="on" title="Demo account: practise with simulated orders on real prices">Demo</button>
   </div>
@@ -141,6 +145,62 @@
     </table>
     <div class="empty-j" id="jempty" hidden>No closed trades yet. Place an order on the chart screen; when you close the position it is logged here.</div>
   </div>
+</main>
+
+<main class="page" id="ordersView" hidden>
+  <section class="card page-card">
+    <h1>Orders</h1>
+    <p>Order management arrives with the execution core. Until then, place practice orders from the ticket on the Board; a closed position is logged in the Journal.</p>
+  </section>
+</main>
+
+<main class="page" id="accountsView" hidden>
+  <div class="jhead"><div><b>Accounts</b><span class="jsub">Practice accounts and, later, your brokers</span></div></div>
+  <p class="no-money" id="acctNote">This app holds no money. Real balances are fetched from your broker; virtual credits are practice only.</p>
+  <div class="acct-list" id="acctList"></div>
+  <form class="card acct-new" id="acctNew" autocomplete="off">
+    <label>New demo account<input name="label" type="text" maxlength="60" placeholder="Name, for example Scalping"></label>
+    <button class="btn" type="submit">Add</button>
+    <p class="acct-msg" id="acctNewMsg" role="status" aria-live="polite"></p>
+  </form>
+  <h2 class="page-h">Brokers</h2>
+  <div class="broker-grid">
+    <article class="card acct broker">
+      <div class="acct-head"><b>Binance</b><span class="tag delay">NOT CONNECTED</span></div>
+      <p>Spot account balances and orders. Arrives with the Binance connector.</p>
+      <button class="btn ghost" type="button" disabled>Connect</button>
+    </article>
+    <article class="card acct broker">
+      <div class="acct-head"><b>FYERS</b><span class="tag delay">NOT CONNECTED</span></div>
+      <p>NSE live data and orders. Arrives with the FYERS connector.</p>
+      <button class="btn ghost" type="button" disabled>Connect</button>
+    </article>
+  </div>
+</main>
+
+<main class="page" id="settingsView" hidden>
+  <div class="jhead"><div><b>Settings</b></div></div>
+  <section class="card page-card">
+    <h2 class="sec-h">General</h2>
+    <div class="set-grid">
+      <label>Timezone<select id="setTz" aria-label="Timezone"></select></label>
+      <label class="set-check"><input type="checkbox" id="setNotify"> Desktop notifications <small>(saved for later: nothing sends them yet)</small></label>
+    </div>
+    <p class="set-msg" id="setMsg" role="status" aria-live="polite"></p>
+  </section>
+  <section class="card page-card">
+    <h2 class="sec-h">Security</h2>
+    <div class="sec-list" id="setSecurity"></div>
+  </section>
+  <section class="card page-card">
+    <div class="sec-top"><h2 class="sec-h">Audit log</h2><span class="jsub" id="auditNote"></span><button class="btn ghost" id="auditRefresh" type="button">Refresh</button></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Entity</th><th>Detail</th></tr></thead>
+        <tbody id="auditBody"></tbody>
+      </table>
+    </div>
+  </section>
 </main>
 
 <footer>Educational tool, not investment advice. Order blocks and liquidity zones here are simple rule-based readings with no proven edge: backtest before risking money. Crypto data: Binance public market data. NSE data: Yahoo Finance, unofficial and delayed.</footer>

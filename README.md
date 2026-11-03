@@ -6,7 +6,8 @@ A personal scanner, chart, journal and backtester for **live crypto** and **dela
 - **Chart:** candles, volume, order block zones, swing-high/low liquidity levels, support and resistance. The forming candle moves trade by trade.
 - **Paper trading:** an order ticket on the chart screen. Buy or sell at the price on screen, watch the position's P&L move, close it. **Simulated: no broker, no real money.**
 - **Journal:** every closed paper trade is logged automatically, per market, with net P&L, win rate, profit factor and fees paid.
-- **Live / Demo account toggle** (top right): **Demo** is the practice account (simulated orders on real prices). **Live** is the account for real orders, which isn't connected to any broker yet.
+- **Pages** (header): Board, Orders (placeholder until the execution core), **Accounts** (the practice account's VIRTUAL credits: edit, reset; Binance and FYERS show "Not connected"), Journal, and **Settings** (timezone, notification toggle, a read-only security summary, the audit log). Accounts and Settings load on first visit; the app remembers your last page.
+- **Live / Demo account toggle** (top right, with the active account's name): **Demo** is the practice account (simulated orders on real prices). **Live** is the account for real orders, which isn't connected to any broker yet.
 - **Backtest:** test the order block rule on years of history before trusting it.
 
 | Market | Data | Speed |

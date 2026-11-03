@@ -194,6 +194,15 @@ function applyMode(next) {
   mode = next;
   document.body.classList.toggle("is-demo", mode === "demo");
   for (const b of $$("#mode button")) b.classList.toggle("on", b.dataset.mode === mode);
+  renderAccountChip();
+}
+
+// The practice account's name, next to the toggle. Orders from the chart screen go to the default demo account.
+let demoLabel = "Demo";
+function renderAccountChip() {
+  const chip = $("#acctChip");
+  chip.textContent = mode === "demo" ? `${demoLabel} · VIRTUAL` : "Live · not connected";
+  chip.className = "acct-chip" + (mode === "demo" ? " virtual" : "");
 }
 
 // Both accounts see the same real prices, so switching restarts nothing: only the ticket, the open positions and the
@@ -214,15 +223,44 @@ $("#mode").addEventListener("click", (e) => {
 $("#goChart").addEventListener("click", () => showView("board"));
 
 // ---------------------------------------------------------------- views
+const VIEWS = ["board", "orders", "accounts", "journal", "settings"];
+
+// The Accounts and Settings pages are fetched on first visit, so they add nothing to the page-load path.
+const pages = {};
+function accountsPage() {
+  return (pages.accounts ??= import("./accounts.js").then((m) => {
+    m.init({
+      onChange: () => market && trading.refresh(), // a reset removes open positions
+      onLoad: (d) => {
+        demoLabel = d.accounts[0]?.label || "Demo";
+        renderAccountChip();
+      },
+    });
+    m.wire();
+    return m;
+  }));
+}
+function settingsPage() {
+  return (pages.settings ??= import("./settings.js").then((m) => (m.wire(), m)));
+}
+
 function showView(v) {
+  if (!VIEWS.includes(v)) v = "board";
   prefs.view = v;
   save();
-  $("#boardView").hidden = v !== "board";
-  $("#journalView").hidden = v !== "journal";
-  for (const b of $$("#tabs button")) b.classList.toggle("on", b.dataset.v === v);
-  if (v === "journal") journal.load();
-  else trading.render();
+  for (const name of VIEWS) $(`#${name}View`).hidden = name !== v;
+  for (const b of $$("#tabs button")) {
+    const on = b.dataset.v === v;
+    b.classList.toggle("on", on);
+    if (on) b.setAttribute("aria-current", "page");
+    else b.removeAttribute("aria-current");
+  }
+  if (v === "board") trading.render();
+  else if (v === "journal") journal.load();
+  else if (v === "accounts") accountsPage().then((m) => m.load(), onPageError);
+  else if (v === "settings") settingsPage().then((m) => m.load(), onPageError);
 }
+const onPageError = (e) => view.banner(`Can't open this page: ${e.message}`, { err: true });
 $("#tabs").addEventListener("click", (e) => {
   const b = e.target.closest("button");
   if (b) showView(b.dataset.v);
@@ -258,6 +296,14 @@ addEventListener("keydown", (e) => {
   applyMode(params.has("live") ? "live" : params.has("demo") ? "demo" : prefs.mode === "live" ? "live" : "demo");
   // Made-up data (development): SAMPLE_DATA=1 on the server or ?sample in the URL; ?sample=0 forces real data.
   sample = params.get("sample") === "0" ? false : config.sample || params.has("sample");
-  showView(prefs.view === "journal" ? "journal" : "board");
+  showView(prefs.view);
   await switchMarket(prefs.market === "india" ? "india" : "crypto");
+  // After the first paint: the practice account's name for the header chip (one small request, off the critical path).
+  api("/api/accounts").then(
+    (d) => {
+      demoLabel = d.accounts[0]?.label || "Demo";
+      renderAccountChip();
+    },
+    () => {},
+  );
 })();

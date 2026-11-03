@@ -190,12 +190,50 @@ const scenarios = [
     assert(p.errors.length === 0, `console errors:\n    ${p.errors.join("\n    ")}`);
   }],
 
+  ["pages: Orders, Accounts and Settings render, labelled and without errors", async (p, url) => {
+    await p.load(url);
+    await waitBooted(p);
+    const go = async (v) => {
+      await p.eval(`document.querySelector('#tabs [data-v=${v}]').click()`);
+      await p.waitFor(`!document.querySelector('#${v}View').hidden && document.querySelectorAll('main:not([hidden])').length === 1`, `${v} page alone on screen`);
+      assert(await p.eval(`document.querySelector('#tabs [data-v=${v}]').getAttribute('aria-current') === 'page'`), `${v} tab not marked current`);
+    };
+    // the header says which account is active, and that it is virtual
+    await p.waitFor(`/VIRTUAL/.test(document.querySelector('#acctChip').textContent)`, "VIRTUAL account chip");
+
+    await go("orders");
+    assert(await p.eval(`/execution core/.test(document.querySelector('#ordersView').textContent)`), "Orders placeholder text missing");
+
+    await go("accounts");
+    await p.waitFor(`document.querySelectorAll('#acctList .acct').length >= 1`, "an account card");
+    const a = await p.eval(`(() => { const c = document.querySelector('#acctList .acct'); return { badge: c.querySelector('.vbadge')?.textContent, text: c.textContent, note: document.querySelector('#acctNote').textContent,
+      brokers: [...document.querySelectorAll('.broker')].map(b => [b.textContent, b.querySelector('button').disabled]) }; })()`);
+    assert(a.badge === "VIRTUAL", `account card badge: ${a.badge}`);
+    assert(/10,000/.test(a.text) && /1,000,000/.test(a.text), "default virtual credits not shown");
+    assert(/holds no money/.test(a.note), "the 'holds no money' line is missing");
+    assert(a.brokers.length === 2 && a.brokers.every(([t, off]) => /Not connected|NOT CONNECTED/i.test(t) && off), "broker cards must say Not connected with a disabled Connect");
+    // edit credits end to end: the server's validation message and a successful save both reach the page
+    await p.eval(`document.querySelector('#acctList .acct-actions button').click()`);
+    await p.eval(`(() => { const f = document.querySelector('#acctList .acct-edit'); f.elements.USDT.value = '0.123456789'; f.requestSubmit(); })()`);
+    await p.waitFor(`/decimal places/.test(document.querySelector('#acctList .acct-msg').textContent)`, "server validation message");
+    p.errors.length = 0; // the browser logs the deliberate 400 above as a console error; anything after it is a real error
+    await p.eval(`(() => { const f = document.querySelector('#acctList .acct-edit'); f.elements.USDT.value = '12500'; f.requestSubmit(); })()`);
+    await p.waitFor(`document.querySelector('#acctList .acct').textContent.includes('12,500')`, "saved credits");
+
+    await go("settings");
+    await p.waitFor(`document.querySelectorAll('#setTz option').length > 5 && document.querySelectorAll('#auditBody tr').length >= 2`, "timezone list and audit rows");
+    const st = await p.eval(`({ sec: document.querySelector('#setSecurity').textContent, audit: document.querySelector('#auditBody').textContent })`);
+    assert(/Live trading\s*disarmed/.test(st.sec) && /API token\s*active/.test(st.sec), `security section: ${st.sec}`);
+    assert(/account_created/.test(st.audit) && /account_updated/.test(st.audit), "audit viewer should show the account events");
+    assert(p.errors.length === 0, `console errors:\n    ${p.errors.join("\n    ")}`);
+  }],
+
   ["mobile 375px: no horizontal scroll", async (p, url) => {
     await p.viewport(375, 812, true);
     try {
       await p.load(url);
       await waitBooted(p);
-      for (const view of ["board", "journal"]) {
+      for (const view of ["board", "orders", "accounts", "journal", "settings"]) {
         await p.eval(`document.querySelector('#tabs [data-v=${view}]').click()`);
         await sleep(300);
         const m = await p.eval(`({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth, bw: document.body.scrollWidth })`);
