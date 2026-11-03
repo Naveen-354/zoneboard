@@ -64,7 +64,12 @@ Hard rules: never touch .env, journal.db or any token file; never use or ask for
 Finish with the report in the format given in docs/platform/WORKFLOW.md section 5.
 "@
 
-$argv = @('--print', $prompt, '--mode', $Mode, '--effort', $Effort, '--print-timeout', '0s', '--output-format', 'text')
+# Windows PowerShell 5.1 does not escape double quotes when it builds a native command line, so a prompt with an odd
+# number of them (correction files quote code) splits into several arguments and agy rejects the run. Escape them the
+# way the Windows argument parser expects: a quote becomes \" and any backslashes right before it are doubled.
+$promptArg = [regex]::Replace($prompt, '(\\*)"', '$1$1\"')
+$promptArg = [regex]::Replace($promptArg, '(\\+)$', '$1$1') # backslashes at the very end would escape the closing quote PowerShell adds
+$argv = @('--print', $promptArg, '--mode', $Mode, '--effort', $Effort, '--print-timeout', '0s', '--output-format', 'text')
 if (-not $NoSandbox) { $argv += '--sandbox' }
 
 if ($DryRun) {
