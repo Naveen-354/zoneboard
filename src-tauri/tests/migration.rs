@@ -3,6 +3,10 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use zoneboard::db::{self, DbError, CURRENT_VERSION};
 use zoneboard::journal::Journal;
+use std::sync::Mutex;
+
+// Any test touching ZONEBOARD_DATA must take this lock to prevent parallel test races.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn temp_db_path(name: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("zb_test_{name}_{}_{}.db", std::process::id(), fastrand()));
@@ -194,6 +198,7 @@ fn migrations_are_idempotent() {
 
 #[test]
 fn data_dir_resolution_does_not_create_directory() {
+    let _lock = ENV_LOCK.lock().unwrap();
     let unique_dir = std::env::temp_dir().join(format!("zb_non_existent_{}_{}", std::process::id(), fastrand()));
     let _ = fs::remove_dir_all(&unique_dir);
 

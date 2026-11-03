@@ -35,16 +35,46 @@ use tracing_subscriber::{
 
 /// Returns true if a field name indicates secret or sensitive credential data.
 pub fn is_secret_field(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    const PATTERNS: &[&str] = &[
-        "api_key",
+    let normalised: String = name
+        .chars()
+        .filter(|&c| c != '_' && c != '-' && c != '.' && c != ' ')
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+
+    const SUBSTRING_MATCHES: &[&str] = &[
+        "apikey",
+        "accesskey",
         "secret",
         "token",
         "password",
+        "passwd",
+        "passphrase",
         "authorization",
         "signature",
+        "privatekey",
+        "credential",
+        "cookie",
+        "bearer",
+        "hsmkey",
+        "mnemonic",
+        "seedphrase",
     ];
-    PATTERNS.iter().any(|&p| lower.contains(p))
+
+    if SUBSTRING_MATCHES.iter().any(|&p| normalised.contains(p)) {
+        return true;
+    }
+
+    const EXACT_MATCHES: &[&str] = &[
+        "pin",
+        "key",
+        "auth",
+        "pem",
+        "otp",
+        "totp",
+        "cvv",
+    ];
+
+    EXACT_MATCHES.iter().any(|&p| normalised == p)
 }
 
 /// Visitor that extracts log fields while replacing sensitive fields with `[REDACTED]`.
@@ -265,6 +295,87 @@ mod tests {
     use secrecy::{SecretBox, SecretString};
     use std::sync::{Arc, Mutex};
     use tracing::info;
+
+    #[test]
+    fn is_secret_field_table_test() {
+        let sensitive = [
+            "api_key",
+            "apiKey",
+            "APIKEY",
+            "X-MBX-APIKEY",
+            "private_key",
+            "privateKey",
+            "passphrase",
+            "pin",
+            "key",
+            "secret_key",
+            "client_secret",
+            "access_token",
+            "refreshToken",
+            "Authorization",
+            "signature",
+            "cookie",
+            "bearer",
+            "hsm_key",
+            "credential",
+            "password",
+        ];
+
+        for field in sensitive {
+            assert!(
+                is_secret_field(field),
+                "expected '{field}' to be identified as secret"
+            );
+        }
+
+        let non_sensitive = [
+            "user",
+            "port",
+            "symbol",
+            "price",
+            "qty",
+            "order_id",
+            "author",
+            "spinning",
+            "monkey",
+            "side",
+        ];
+
+        for field in non_sensitive {
+            assert!(
+                !is_secret_field(field),
+                "expected '{field}' to NOT be identified as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn redacting_formatter_redacts_camel_case_and_uppercase_secret_fields() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .event_format(RedactingFormatter)
+            .with_writer(TestBuffer(buffer.clone()))
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            info!(
+                apiKey = "leak-me-123",
+                X_MBX_APIKEY = "leak-me-456",
+                "request headers"
+            );
+        });
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+
+        // Plaintext values must NOT appear anywhere in the output
+        assert!(!output.contains("leak-me-123"), "leaked apiKey: {output}");
+        assert!(!output.contains("leak-me-456"), "leaked X_MBX_APIKEY: {output}");
+
+        // Field names are present with [REDACTED]
+        assert!(output.contains("apiKey=[REDACTED]"), "apiKey not redacted: {output}");
+        assert!(output.contains("X_MBX_APIKEY=[REDACTED]"), "X_MBX_APIKEY not redacted: {output}");
+    }
 
     #[test]
     fn secret_fields_are_redacted_in_structured_logs() {
