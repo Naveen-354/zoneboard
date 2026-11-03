@@ -8,16 +8,19 @@ use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
 use chrono::{FixedOffset, Utc};
+use rand::rngs::OsRng;
+use rand::RngCore;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use serde_json::{json, Value};
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 use crate::data::{self, DataStore};
@@ -33,10 +36,51 @@ const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsa
     connect-src 'self' https://data-api.binance.vision wss://data-stream.binance.vision; \
     object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 
+/// Generates a cryptographically secure 256-bit random API token formatted as lowercase hex (64 chars).
+fn generate_api_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Constant-time string equality comparison to prevent timing side-channel attacks on token verification.
+#[doc(hidden)]
+pub fn constant_time_compare(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+/// Checks if an `Origin` header matches the server's own origin (`http://{host}`).
+fn is_same_origin(origin: &str, host: &str) -> bool {
+    origin.eq_ignore_ascii_case(&format!("http://{host}"))
+}
+
+/// Extracts the API token from an incoming request.
+/// Today it reads the `X-ZB-Token` header.
+///
+/// # Extension Point
+/// Future Server-Sent Events (SSE) endpoints using browser `EventSource` cannot set
+/// custom HTTP headers; an `auth` or `token` query parameter (e.g. `?token=...`) can
+/// be accepted here specifically for designated SSE routes.
+fn token_from_request(req: &Request) -> Option<&str> {
+    req.headers().get("X-ZB-Token").and_then(|v| v.to_str().ok())
+}
+
+/// Replaces the placeholder `<meta name="zb-token" content="">` with the server's launch token.
+#[doc(hidden)]
+pub fn render_index_html(template: &str, token: &str) -> String {
+    const PLACEHOLDER: &str = r#"<meta name="zb-token" content="">"#;
+    let replacement = format!(r#"<meta name="zb-token" content="{token}">"#);
+    template.replace(PLACEHOLDER, &replacement)
+}
+
 pub struct AppState {
     data: DataStore,
     journal: Journal,
     scan: [Mutex<Option<(Instant, Value)>>; 2], // indexed by `sample as usize`: sample and real scans never share a cache
+    api_token: String,
 }
 
 pub type Shared = Arc<AppState>;
@@ -44,7 +88,19 @@ pub type Shared = Arc<AppState>;
 impl AppState {
     pub fn new(sample: bool, journal_path: &str) -> Result<Shared, String> {
         let journal = Journal::open(journal_path).map_err(|e| format!("can't open journal {journal_path}: {e}"))?;
-        Ok(Arc::new(Self { data: DataStore::new(sample), journal, scan: [Mutex::new(None), Mutex::new(None)] }))
+        let api_token = generate_api_token();
+        Ok(Arc::new(Self {
+            data: DataStore::new(sample),
+            journal,
+            scan: [Mutex::new(None), Mutex::new(None)],
+            api_token,
+        }))
+    }
+
+    /// Read-only accessor for the in-memory API token.
+    #[doc(hidden)]
+    pub fn api_token(&self) -> &str {
+        &self.api_token
     }
 
     /// `?sample=1` / `?sample=0` on a request; without it the `SAMPLE_DATA=1` environment decides.
@@ -76,18 +132,50 @@ pub fn app(state: Shared) -> Router {
         .route("/api/journal/{id}", delete(journal_delete))
         .route("/api/positions", get(positions_get).post(positions_open))
         .route("/api/positions/{id}/close", post(positions_close))
-        .layer(middleware::from_fn(guard))
+        .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
 
 /// Rejects foreign Host headers (stops DNS rebinding: a web page can't reach this no-login app through a
 /// hostname it controls) and adds the security headers.
-async fn guard(req: Request, next: Next) -> Response {
+///
+/// # Threat Model
+/// Protects against: other websites (Cross-Site Request Forgery / CSRF, DNS rebinding) and
+/// browser extensions on other origins attempting to use this local API.
+/// Does **NOT** protect against malware or malicious processes already running as this
+/// Windows user, which could read the page, local database, or keychain anyway.
+async fn guard(State(state): State<Shared>, req: Request, next: Next) -> Response {
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("").to_string();
     let name = if host.ends_with(']') { host.as_str() } else { host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h) };
     if !matches!(name, "127.0.0.1" | "localhost" | "[::1]") {
         return err(StatusCode::FORBIDDEN, "this app only answers on localhost");
     }
+    // CSRF origin check on state-changing methods
+    let method = req.method();
+    if matches!(method, &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE) {
+        if let Some(origin_val) = req.headers().get(header::ORIGIN) {
+            let Ok(origin_str) = origin_val.to_str() else {
+                return err(StatusCode::FORBIDDEN, "invalid origin");
+            };
+            if !is_same_origin(origin_str, &host) {
+                return err(StatusCode::FORBIDDEN, "cross-origin requests are forbidden");
+            }
+        }
+    }
+
+    // Route protection by path prefix: all /api and /api/* endpoints require the launch token
+    let path = req.uri().path();
+    if path == "/api" || path.starts_with("/api/") {
+        let provided = token_from_request(&req);
+        let valid = match provided {
+            Some(tok) => constant_time_compare(tok, state.api_token()),
+            None => false,
+        };
+        if !valid {
+            return err(StatusCode::UNAUTHORIZED, "missing or invalid API token");
+        }
+    }
+
     let mut resp = next.run(req).await;
     let is_html = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/html"));
     let h = resp.headers_mut();
@@ -132,8 +220,22 @@ fn asset(path: &str, req: &HeaderMap) -> Response {
         .into_response()
 }
 
-async fn index(headers: HeaderMap) -> Response {
-    asset("index.html", &headers)
+async fn index(State(s): State<Shared>) -> Response {
+    let Some(file) = Assets::get("index.html") else {
+        return err(StatusCode::NOT_FOUND, "not found");
+    };
+    let Ok(html) = std::str::from_utf8(&file.data) else {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "invalid html");
+    };
+    let rendered = render_index_html(html, s.api_token());
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        rendered,
+    )
+        .into_response()
 }
 
 async fn static_file(Path(path): Path<String>, headers: HeaderMap) -> Response {
