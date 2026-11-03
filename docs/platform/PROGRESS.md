@@ -12,6 +12,8 @@ Single source of shared context for Claude, Antigravity and the owner. Claude up
 
 ## Decisions
 
+_Planned deletion:_ Delete the Python backend after Phase 1 if parity tests have moved to fixtures (T009 froze it; see D4).
+
 | # | Decision | Status |
 |---|---|---|
 | D1 | Binance scope | default **spot only**; awaiting owner |

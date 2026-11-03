@@ -1,4 +1,8 @@
-"""Free market data via Yahoo Finance (yfinance).
+"""FROZEN (T009, decision D4): legacy Python backend, kept as the reference for the zone/backtest
+rules and the parity fixture (data layer). New features go to the Rust app only; change this
+file only to keep the parity fixture and existing tests green. See AGENTS.md.
+
+Free market data via Yahoo Finance (yfinance).
 
 Important:
   * Data is unofficial and delayed (often ~15 minutes). Fine for learning and
