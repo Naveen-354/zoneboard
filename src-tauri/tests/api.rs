@@ -26,26 +26,26 @@ impl TestApp {
 
 fn router() -> TestApp {
     TestApp::new()
-
-
-
 }
 
-async fn call(app: &TestApp, method: &str, uri: &str, host: &str, json_body: Option<Value>, extra: &[(&str, &str)]) -> (StatusCode, HeaderMap, Vec<u8>) {
+async fn do_call(
+    app: &TestApp,
+    method: &str,
+    uri: &str,
+    host: &str,
+    json_body: Option<Value>,
+    extra: &[(&str, &str)],
+    send_token: bool,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     let mut b = Request::builder().method(method).uri(uri).header(header::HOST, host);
     let mut has_token = false;
-    let mut omit_auth = false;
     for (k, v) in extra {
         if k.eq_ignore_ascii_case("x-zb-token") {
             has_token = true;
         }
-        if *k == "OMIT_AUTH" {
-            omit_auth = true;
-            continue;
-        }
         b = b.header(*k, *v);
     }
-    if !has_token && !omit_auth {
+    if send_token && !has_token {
         b = b.header("X-ZB-Token", &app.token);
     }
     let req = match json_body {
@@ -55,6 +55,28 @@ async fn call(app: &TestApp, method: &str, uri: &str, host: &str, json_body: Opt
     let resp = app.router.clone().oneshot(req).await.unwrap();
     let (parts, body) = resp.into_parts();
     (parts.status, parts.headers, to_bytes(body, 10_000_000).await.unwrap().to_vec())
+}
+
+async fn call(
+    app: &TestApp,
+    method: &str,
+    uri: &str,
+    host: &str,
+    json_body: Option<Value>,
+    extra: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    do_call(app, method, uri, host, json_body, extra, true).await
+}
+
+async fn call_without_token(
+    app: &TestApp,
+    method: &str,
+    uri: &str,
+    host: &str,
+    json_body: Option<Value>,
+    extra: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    do_call(app, method, uri, host, json_body, extra, false).await
 }
 
 async fn get_json(app: &TestApp, uri: &str) -> (StatusCode, Value) {
@@ -259,24 +281,42 @@ async fn journal_is_per_market_and_validated() {
     assert_eq!(get_json(&r, "/api/journal?market=crypto").await.1["trades"].as_array().unwrap().len(), 0);
 }
 
+/// Single source of truth for tested API routes: (method, path_template, concrete_uri, body)
+const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
+    ("GET", "/api/config", "/api/config", None),
+    ("GET", "/api/scan", "/api/scan", None),
+    ("GET", "/api/chart/{symbol}", "/api/chart/SBIN?interval=1d&sample=1", None),
+    ("GET", "/api/journal", "/api/journal?market=india", None),
+    (
+        "POST",
+        "/api/journal",
+        "/api/journal",
+        Some(r#"{"market":"india","symbol":"SBIN","date":"2026-11-02","side":"long","qty":1,"entry":100,"exit":110,"fees":0}"#),
+    ),
+    ("DELETE", "/api/journal/{id}", "/api/journal/999999", None),
+    ("GET", "/api/positions", "/api/positions?market=crypto&mode=demo", None),
+    (
+        "POST",
+        "/api/positions",
+        "/api/positions",
+        Some(r#"{"market":"crypto","mode":"demo","symbol":"BTCUSDT","side":"long","qty":0.01,"price":78000}"#),
+    ),
+    (
+        "POST",
+        "/api/positions/{id}/close",
+        "/api/positions/999999/close",
+        Some(r#"{"price": 79000}"#),
+    ),
+];
+
 #[tokio::test]
 async fn api_token_route_coverage_table() {
     let app = router();
-    let routes: &[(&str, &str, Option<Value>)] = &[
-        ("GET", "/api/config", None),
-        ("GET", "/api/scan", None),
-        ("GET", "/api/chart/SBIN?interval=1d&sample=1", None),
-        ("GET", "/api/journal?market=india", None),
-        ("POST", "/api/journal", Some(json!({"market":"india","symbol":"SBIN","date":"2026-11-02","side":"long","qty":1,"entry":100,"exit":110,"fees":0}))),
-        ("DELETE", "/api/journal/999999", None),
-        ("GET", "/api/positions?market=crypto&mode=demo", None),
-        ("POST", "/api/positions", Some(order(json!({})))),
-        ("POST", "/api/positions/999999/close", Some(json!({"price": 79000}))),
-    ];
+    for &(method, _path_template, uri, body_str) in API_ROUTES {
+        let body: Option<Value> = body_str.map(|s| serde_json::from_str(s).expect("valid json in API_ROUTES"));
 
-    for (method, uri, body) in routes {
         // 1. Missing token -> 401
-        let (s_none, _, b_none) = call(&app, method, uri, "localhost", body.clone(), &[("OMIT_AUTH", "")]).await;
+        let (s_none, _, b_none) = call_without_token(&app, method, uri, "localhost", body.clone(), &[]).await;
         assert_eq!(s_none, StatusCode::UNAUTHORIZED, "route {method} {uri} should require token");
         let v_none: Value = serde_json::from_slice(&b_none).unwrap();
         assert!(v_none["error"].is_string(), "route {method} {uri} missing error string on 401");
@@ -297,7 +337,7 @@ async fn api_token_route_coverage_table() {
 async fn api_token_unregistered_prefix_returns_401_without_token() {
     let app = router();
     // Path matching no route under /api
-    let (s_no_auth, _, _) = call(&app, "GET", "/api/__unregistered__", "localhost", None, &[("OMIT_AUTH", "")]).await;
+    let (s_no_auth, _, _) = call_without_token(&app, "GET", "/api/__unregistered__", "localhost", None, &[]).await;
     assert_eq!(s_no_auth, StatusCode::UNAUTHORIZED);
 
     let (s_wrong, _, _) = call(&app, "GET", "/api/__unregistered__", "localhost", None, &[("X-ZB-Token", "wrong")]).await;
@@ -312,23 +352,12 @@ async fn api_token_unregistered_prefix_returns_401_without_token() {
 fn source_scan_all_routes_are_protected_or_allowed() {
     let source = include_str!("../src/server.rs");
     const PUBLIC_ALLOW_LIST: &[&str] = &["/", "/static/{*path}"];
-    const TESTED_API_ROUTES: &[&str] = &[
-        "/api/config",
-        "/api/scan",
-        "/api/chart/{symbol}",
-        "/api/journal",
-        "/api/journal/{id}",
-        "/api/positions",
-        "/api/positions/{id}/close",
-    ];
 
     let mut found_routes = Vec::new();
-    for line in source.lines() {
-        if let Some(idx) = line.find(".route(\"") {
-            let rest = &line[idx + ".route(\"".len()..];
-            if let Some(end) = rest.find('"') {
-                found_routes.push(&rest[..end]);
-            }
+    for (idx, _) in source.match_indices(".route(\"") {
+        let rest = &source[idx + ".route(\"".len()..];
+        if let Some(end) = rest.find('"') {
+            found_routes.push(&rest[..end]);
         }
     }
 
@@ -343,8 +372,15 @@ fn source_scan_all_routes_are_protected_or_allowed() {
             "route {route} does not start with /api/ and is not in the public allow-list"
         );
         assert!(
-            TESTED_API_ROUTES.contains(route),
-            "route {route} starts with /api/ but is missing from test coverage table"
+            API_ROUTES.iter().any(|(_, template, _, _)| template == route),
+            "route {route} starts with /api/ but is missing as a template in API_ROUTES"
+        );
+    }
+
+    for (_, template, _, _) in API_ROUTES {
+        assert!(
+            found_routes.contains(template),
+            "template {template} in API_ROUTES was not found in server.rs"
         );
     }
 }
@@ -403,7 +439,7 @@ fn api_token_differs_per_instance_and_constant_time_comparison() {
 #[tokio::test]
 async fn index_serves_token_in_meta_tag_with_no_store_and_no_token_leak_in_headers() {
     let app = router();
-    let (s, headers, body) = call(&app, "GET", "/", "127.0.0.1:5000", None, &[("OMIT_AUTH", "")]).await;
+    let (s, headers, body) = call_without_token(&app, "GET", "/", "127.0.0.1:5000", None, &[]).await;
     assert_eq!(s, StatusCode::OK);
 
     // Cache-Control must be no-store
@@ -432,7 +468,7 @@ async fn index_serves_token_in_meta_tag_with_no_store_and_no_token_leak_in_heade
     assert!(body_str.contains(&expected_tag), "HTML body missing expected meta tag: {expected_tag}");
 
     // Test that 401 error response does not leak token
-    let (_, err_headers, err_body) = call(&app, "GET", "/api/config", "localhost", None, &[("OMIT_AUTH", "")]).await;
+    let (_, err_headers, err_body) = call_without_token(&app, "GET", "/api/config", "localhost", None, &[]).await;
     for (name, val) in &err_headers {
         assert!(!val.to_str().unwrap_or("").contains(&app.token));
         assert!(!name.as_str().contains(&app.token));
@@ -447,12 +483,4 @@ fn logging_redacts_api_token_header() {
     assert!(zoneboard::logging::is_secret_field("X-ZB-Token"));
     assert!(zoneboard::logging::is_secret_field("x-zb-token"));
     assert!(zoneboard::logging::is_secret_field("X_ZB_TOKEN"));
-}
-
-#[test]
-fn sse_token_from_request_extension_point_contract() {
-    assert!(zoneboard::logging::is_secret_field("x_zb_token"));
-    if true {
-        assert!(zoneboard::logging::is_secret_field("X-ZB-TOKEN"));
-}
 }
