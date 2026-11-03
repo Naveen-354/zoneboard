@@ -222,3 +222,65 @@ fn data_dir_resolution_does_not_create_directory() {
         std::env::remove_var("ZONEBOARD_DATA");
     }
 }
+
+#[test]
+fn fixture_v2_migrates_to_v3_with_data_intact() {
+    let db_path = create_from_fixture("legacy_v0_paper_live.sql");
+    let path_str = db_path.to_str().unwrap();
+
+    let mut conn = Connection::open(path_str).unwrap();
+
+    // Run migrations 1 and 2 manually to bring the legacy fixture to v2 state
+    conn.execute_batch(
+        "UPDATE trades SET mode = 'demo' WHERE mode = 'live' AND notes = 'Paper trade';
+         UPDATE positions SET mode = 'demo' WHERE mode = 'live';
+         PRAGMA user_version = 2;",
+    ).unwrap();
+
+    assert_eq!(db::user_version(&conn).unwrap(), 2);
+
+    // Verify v2 data counts before v3 migration
+    let trade_count_v2: i64 = conn.query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0)).unwrap();
+    let pos_count_v2: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0)).unwrap();
+    assert_eq!(trade_count_v2, 2);
+    assert_eq!(pos_count_v2, 1);
+
+    // Run migration to v3
+    db::migrate(&mut conn).unwrap();
+
+    assert_eq!(db::user_version(&conn).unwrap(), CURRENT_VERSION);
+    assert_eq!(db::user_version(&conn).unwrap(), 3);
+
+    // Verify data is completely intact
+    let trade_count_v3: i64 = conn.query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0)).unwrap();
+    let pos_count_v3: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0)).unwrap();
+    assert_eq!(trade_count_v3, trade_count_v2);
+    assert_eq!(pos_count_v3, pos_count_v2);
+
+    let (btc_sym, btc_mode): (String, String) = conn.query_row(
+        "SELECT symbol, mode FROM trades WHERE symbol = 'BTCUSDT'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!(btc_sym, "BTCUSDT");
+    assert_eq!(btc_mode, "demo");
+
+    // Verify audit_log and settings tables and triggers are active
+    let audit_count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0)).unwrap();
+    assert_eq!(audit_count, 0);
+
+    let settings_count: i64 = conn.query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0)).unwrap();
+    assert_eq!(settings_count, 0);
+
+    // Insert into audit_log and verify append-only trigger works
+    conn.execute(
+        "INSERT INTO audit_log (id, ts_utc, actor, action, entity, detail_json)
+         VALUES (1, '2026-11-03T00:00:00Z', 'system', 'test', 'system', '{}')",
+        [],
+    ).unwrap();
+    let res = conn.execute("UPDATE audit_log SET actor = 'bad' WHERE id = 1", []);
+    assert!(res.is_err(), "UPDATE on audit_log must be blocked by trigger");
+
+    drop(conn);
+    let _ = fs::remove_file(&db_path);
+}

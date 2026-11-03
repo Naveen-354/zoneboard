@@ -88,6 +88,18 @@ pub type Shared = Arc<AppState>;
 impl AppState {
     pub fn new(sample: bool, journal_path: &str) -> Result<Shared, String> {
         let journal = Journal::open(journal_path).map_err(|e| format!("can't open journal {journal_path}: {e}"))?;
+        journal.with_conn(|conn| {
+            crate::audit::record(
+                conn,
+                "system",
+                "app_start",
+                "system",
+                &json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "sample": sample,
+                }),
+            )
+        }).map_err(|e| format!("can't record app_start audit entry: {e}"))?;
         let api_token = generate_api_token();
         Ok(Arc::new(Self {
             data: DataStore::new(sample),
@@ -132,6 +144,8 @@ pub fn app(state: Shared) -> Router {
         .route("/api/journal/{id}", delete(journal_delete))
         .route("/api/positions", get(positions_get).post(positions_open))
         .route("/api/positions/{id}/close", post(positions_close))
+        .route("/api/audit", get(audit_get))
+        .route("/api/settings", get(settings_get).put(settings_put))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -394,6 +408,68 @@ async fn positions_close(State(s): State<Shared>, Path(id): Path<i64>, headers: 
     }
 }
 
+fn parse_audit_query(q: &HashMap<String, String>) -> Result<(usize, Option<i64>), String> {
+    let limit = match q.get("limit") {
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) | Err(_) => return Err("limit must be a positive integer".to_string()),
+            Ok(n) => n.min(500),
+        },
+        None => 50,
+    };
+
+    let before = match q.get("before") {
+        Some(s) => match s.parse::<i64>() {
+            Ok(id) if id > 0 => Some(id),
+            _ => return Err("before must be a positive integer".to_string()),
+        },
+        None => None,
+    };
+
+    Ok((limit, before))
+}
+
+async fn audit_get(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let (limit, before) = match parse_audit_query(&q) {
+        Ok(vals) => vals,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+    };
+
+    let result = s.journal.with_conn(|conn| crate::audit::list(conn, limit, before));
+    match result {
+        Ok((entries, next_before)) => {
+            Json(json!({ "entries": entries, "next_before": next_before })).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("audit query failed: {e}")),
+    }
+}
+
+async fn settings_get(State(s): State<Shared>) -> Response {
+    match s.journal.with_conn(|conn| crate::settings::get_settings(conn)) {
+        Ok(settings) => Json(settings).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("failed to get settings: {e}")),
+    }
+}
+
+async fn settings_put(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let body_json = json_body(&headers, &body);
+    let body_obj = match body_json {
+        Value::Object(map) => map,
+        _ => return err(StatusCode::BAD_REQUEST, "request body must be a JSON object"),
+    };
+
+    let result = s.journal.with_conn(|conn| crate::settings::update_settings(conn, &body_obj));
+    match result {
+        Ok(updated) => Json(updated).into_response(),
+        Err(crate::settings::SettingsError::RuntimeOnlyKey(msg)) => err(StatusCode::BAD_REQUEST, &msg),
+        Err(crate::settings::SettingsError::Validation(msg)) => err(StatusCode::BAD_REQUEST, &msg),
+        Err(crate::settings::SettingsError::Database(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, &format!("database error: {e}")),
+    }
+}
+
 // ------------------------------------------------------------------ serving
 /// Loopback listeners, never reachable from the network. Port from `PORT`, else 5000; if 5000 is taken
 /// (and none was asked for) any free port. The first listener is 127.0.0.1; `[::1]` is added on the same
@@ -449,4 +525,57 @@ pub fn spawn() -> Result<u16, String> {
         })
         .map_err(|e| e.to_string())?;
     Ok(port)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_audit_query_limits_and_before() {
+        let mut q = HashMap::new();
+
+        // no limit -> 50, no before -> None
+        assert_eq!(parse_audit_query(&q), Ok((50, None)));
+
+        // 500 -> 500
+        q.insert("limit".to_string(), "500".to_string());
+        assert_eq!(parse_audit_query(&q), Ok((500, None)));
+
+        // 501 -> 500
+        q.insert("limit".to_string(), "501".to_string());
+        assert_eq!(parse_audit_query(&q), Ok((500, None)));
+
+        // 100000 -> 500
+        q.insert("limit".to_string(), "100000".to_string());
+        assert_eq!(parse_audit_query(&q), Ok((500, None)));
+
+        // 0, -1, abc -> error
+        q.insert("limit".to_string(), "0".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        q.insert("limit".to_string(), "-1".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        q.insert("limit".to_string(), "abc".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        // reset valid limit
+        q.insert("limit".to_string(), "20".to_string());
+
+        // before 0, -5, abc -> error
+        q.insert("before".to_string(), "0".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        q.insert("before".to_string(), "-5".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        q.insert("before".to_string(), "abc".to_string());
+        assert!(parse_audit_query(&q).is_err());
+
+        // valid before passes through
+        q.insert("before".to_string(), "42".to_string());
+        assert_eq!(parse_audit_query(&q), Ok((20, Some(42))));
+    }
 }
