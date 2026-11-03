@@ -22,3 +22,17 @@ New tables, converting current columns, any UI change, API changes.
 
 ## Notes
 New dependencies allowed (pre-approved in ROADMAP D8): `rust_decimal`, `tracing`, `tracing-subscriber`, `secrecy`. Anything else: stop and ask.
+
+## Plan review: corrections the implementation must follow (Claude, 2026-11-03)
+Antigravity's plan was reviewed and approved **with these changes**. Where it differs from the plan, this section wins.
+
+1. **Set `user_version` inside the migration's own transaction**, not after the commit. A crash between the two must not leave a migrated schema with an old version. (The plan set it after `COMMIT`.)
+2. **Fixtures are SQL text files** (`tests/fixtures/legacy_*.sql`) that the tests execute into a temp database, **not committed binary `.db` files**. They must be reviewable in a diff.
+3. **Number-to-decimal conversion must use the number's shortest decimal text**, not a raw float conversion. Test JSON numbers `0.1`, `0.2`, `0.3`, `0.00000486`, `1e-8` and `123456789.12345678` against their string forms, and document what `from_legacy_f64` rounds to.
+4. **Check the `secrecy` API before coding.** Version 0.10 reportedly replaced `Secret<T>` with `SecretBox<T>` / `SecretString`; use whatever the official docs show, and record it. Also state in the `logging.rs` doc comment, and test, the real limit of field-name redaction: **a secret interpolated into the log message text is not masked.** Convention for the repo: secrets only ever go in fields, never in message strings.
+5. **`data_dir()` must not create directories when it merely resolves a path.** Creation belongs in startup (`ensure_data_dir`). Tests must never create folders in the real `%APPDATA%`: set `ZONEBOARD_DATA` to a temp folder in any test that resolves it.
+6. **Log writer:** keep one open file handle behind a mutex and reopen only when the date changes. Do not open the file for every event.
+
+Accepted answers to the plan's questions: keep daily logs indefinitely for now (pruning is a Phase 5 task); returning a `DbError` from `Journal::open` is fine as long as callers and tests need no change.
+
+**Run notes:** the terminal sandbox blocks `cargo` (`os error 5` writing `target/`). Implementation runs use `-NoSandbox`; see `docs/platform/WORKFLOW.md`, "Known limitation".
