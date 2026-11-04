@@ -68,6 +68,32 @@ fn smoothed(x: &[f64], n: usize, alpha: f64) -> Series {
     out
 }
 
+/// Linearly weighted moving average: the newest bar weighs `n`, the oldest 1.
+pub fn wma(x: &[f64], n: usize) -> Series {
+    let mut out = vec![NAN; x.len()];
+    if n == 0 {
+        return out;
+    }
+    let denom = (n * (n + 1) / 2) as f64;
+    for i in (n - 1)..x.len() {
+        let w = &x[i + 1 - n..=i];
+        if w.iter().all(|v| v.is_finite()) {
+            out[i] = w.iter().enumerate().map(|(k, v)| (k + 1) as f64 * v).sum::<f64>() / denom;
+        }
+    }
+    out
+}
+
+/// Stochastic oscillator: %K = where the close sits in the last `n` bars' range (smoothed over `smooth`),
+/// %D = SMA of %K over `d`. 50 on a flat range.
+pub fn stochastic(f: &Frame, n: usize, smooth: usize, d: usize) -> (Series, Series) {
+    let (hi, lo) = (highest(&f.h, n), lowest(&f.l, n));
+    let raw: Series = (0..f.len()).map(|i| if !hi[i].is_finite() { NAN } else if hi[i] == lo[i] { 50.0 } else { 100.0 * (f.c[i] - lo[i]) / (hi[i] - lo[i]) }).collect();
+    let k = sma(&raw, smooth);
+    let dd = sma(&k, d);
+    (k, dd)
+}
+
 /// Exponential moving average, `alpha = 2 / (n + 1)`.
 pub fn ema(x: &[f64], n: usize) -> Series {
     smoothed(x, n, 2.0 / (n as f64 + 1.0))
@@ -390,6 +416,7 @@ pub struct Spec {
 
 pub const SPECS: &[Spec] = &[
     Spec { kind: "sma", name: "Simple moving average", group: "trend", params: &[p("period", 20.0, 1.0, 500.0)], outputs: &["value"], about: "Mean close of the last N bars." },
+    Spec { kind: "wma", name: "Weighted moving average", group: "trend", params: &[p("period", 20.0, 1.0, 500.0)], outputs: &["value"], about: "Linearly weighted: the newest close counts most." },
     Spec { kind: "ema", name: "Exponential moving average", group: "trend", params: &[p("period", 20.0, 1.0, 500.0)], outputs: &["value"], about: "Weighted average that reacts faster to recent closes." },
     Spec { kind: "macd", name: "MACD", group: "trend", params: &[p("fast", 12.0, 1.0, 200.0), p("slow", 26.0, 2.0, 400.0), p("signal", 9.0, 1.0, 100.0)], outputs: &["macd", "signal", "hist"], about: "Fast EMA minus slow EMA, with a signal line." },
     Spec { kind: "adx", name: "ADX / DMI", group: "trend", params: &[p("period", 14.0, 2.0, 200.0)], outputs: &["adx", "plus_di", "minus_di"], about: "Trend strength (ADX) and direction (+DI vs -DI), Wilder." },
@@ -399,6 +426,7 @@ pub const SPECS: &[Spec] = &[
     Spec { kind: "atr", name: "Average True Range", group: "advanced", params: &[p("period", 14.0, 1.0, 200.0)], outputs: &["value"], about: "Wilder-smoothed true range: how far price usually moves per bar." },
     Spec { kind: "rsi", name: "RSI", group: "momentum", params: &[p("period", 14.0, 2.0, 200.0)], outputs: &["value"], about: "Wilder relative strength, 0 to 100." },
     Spec { kind: "stoch_rsi", name: "Stochastic RSI", group: "momentum", params: &[p("rsi_period", 14.0, 2.0, 200.0), p("stoch_period", 14.0, 2.0, 200.0), p("k", 3.0, 1.0, 50.0), p("d", 3.0, 1.0, 50.0)], outputs: &["k", "d"], about: "Where RSI sits in its recent range, smoothed, 0 to 100." },
+    Spec { kind: "stoch", name: "Stochastic", group: "momentum", params: &[p("period", 14.0, 2.0, 200.0), p("smooth", 3.0, 1.0, 50.0), p("d", 3.0, 1.0, 50.0)], outputs: &["k", "d"], about: "Where the close sits in the recent high-low range, 0 to 100." },
     Spec { kind: "cci", name: "CCI", group: "momentum", params: &[p("period", 20.0, 2.0, 200.0)], outputs: &["value"], about: "Typical price versus its mean, in units of mean deviation." },
     Spec { kind: "roc", name: "Rate of Change", group: "momentum", params: &[p("period", 10.0, 1.0, 500.0)], outputs: &["value"], about: "Percent change over N bars." },
     Spec { kind: "bollinger", name: "Bollinger Bands", group: "mean_reversion", params: &[p("period", 20.0, 2.0, 500.0), pf("stddev", 2.0, 0.1, 10.0)], outputs: &["upper", "middle", "lower", "pct_b", "width"], about: "SMA plus and minus K population standard deviations." },
@@ -406,6 +434,7 @@ pub const SPECS: &[Spec] = &[
     Spec { kind: "zscore", name: "Z-Score", group: "mean_reversion", params: &[p("period", 20.0, 2.0, 500.0)], outputs: &["value"], about: "How many standard deviations the close is from its N-bar mean." },
     Spec { kind: "obv", name: "On-Balance Volume", group: "volume", params: &[], outputs: &["value"], about: "Running total of volume, added on up closes and subtracted on down closes." },
     Spec { kind: "obv_ema", name: "OBV signal (EMA of OBV)", group: "volume", params: &[p("period", 20.0, 1.0, 500.0)], outputs: &["value"], about: "EMA of OBV, to compare OBV against." },
+    Spec { kind: "volume_sma", name: "Volume moving average", group: "volume", params: &[p("period", 20.0, 1.0, 500.0)], outputs: &["value"], about: "Mean volume of the last N bars." },
     Spec { kind: "volume_ratio", name: "Volume breakout ratio", group: "volume", params: &[p("period", 20.0, 1.0, 500.0)], outputs: &["value"], about: "This bar's volume divided by the average of the previous N bars." },
     Spec { kind: "vw_momentum", name: "Volume-weighted momentum", group: "volume", params: &[p("period", 14.0, 1.0, 500.0)], outputs: &["value"], about: "Volume-weighted mean bar return over N bars, percent." },
 ];
@@ -451,6 +480,17 @@ pub fn compute(kind: &str, params: &[f64], f: &Frame) -> Result<Outputs, String>
         }
         "ema" => {
             o.insert("value", ema(&f.c, u(0)));
+        }
+        "wma" => {
+            o.insert("value", wma(&f.c, u(0)));
+        }
+        "stoch" => {
+            let (k, d) = stochastic(f, u(0), u(1), u(2));
+            o.insert("k", k);
+            o.insert("d", d);
+        }
+        "volume_sma" => {
+            o.insert("value", sma(&f.v, u(0)));
         }
         "macd" => {
             let (a, b, c) = macd(&f.c, u(0), u(1), u(2));
@@ -600,6 +640,18 @@ mod tests {
         close(&rma(&x, 3), &[NAN, NAN, 2.0, r3, r3 + (5.0 - r3) / 3.0], 1e-12);
         // leading NaNs (a MACD line) are skipped, not propagated forever
         close(&ema(&[NAN, NAN, 1.0, 2.0, 3.0, 4.0], 2), &[NAN, NAN, NAN, 1.5, 1.5 + (3.0 - 1.5) * 2.0 / 3.0, 2.5 + (4.0 - 2.5) * 2.0 / 3.0], 1e-12);
+    }
+
+    #[test]
+    fn wma_and_stochastic_by_hand() {
+        // (1*1 + 2*2 + 3*3) / 6
+        close(&wma(&[1.0, 2.0, 3.0], 3), &[NAN, NAN, 14.0 / 6.0], 1e-12);
+        let mut f = Frame::default();
+        for (h, l, c) in [(10.0, 0.0, 5.0), (10.0, 0.0, 10.0), (10.0, 0.0, 0.0)] {
+            f.push(0, c, h, l, c, 1.0);
+        }
+        let (k, _) = stochastic(&f, 2, 1, 1);
+        close(&k, &[NAN, 100.0, 0.0], 1e-12);
     }
 
     #[test]

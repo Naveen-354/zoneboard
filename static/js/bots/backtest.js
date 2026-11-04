@@ -152,7 +152,46 @@ function results(r) {
   out.append(...[warn, src, stats, charts].filter(Boolean));
   disposers.push(priceChart(pch, r.candles, r.overlays, markers));
   disposers.push(lineChart(ech, r.equity, { baseline: Number(m.start_capital) }));
-  out.append(winLoss(r), tradesTable(r), el("p", "st-about", r.assumptions + (r.open_lots ? ` ${r.open_lots} position(s) were still open at the end.` : "")));
+  out.append(research(r), winLoss(r), tradesTable(r), el("p", "st-about", r.assumptions + (r.open_lots ? ` ${r.open_lots} position(s) were still open at the end.` : "")));
+}
+
+function research(r) {
+  const c = el("section", "card st-card");
+  c.append(el("h4", null, "Robustness and reproducibility"));
+  const mc = r.monte_carlo;
+  if (mc?.available) {
+    const g = el("div", "stats");
+    g.append(
+      stat("Return, 5th pct", pct(mc.return_pct.p5), mc.return_pct.p5 < 0 ? "dn" : "up"),
+      stat("Return, median", pct(mc.return_pct.p50)),
+      stat("Return, 95th pct", pct(mc.return_pct.p95)),
+      stat("Max DD, 95th pct", pct(mc.max_drawdown_pct.p95), "dn"),
+      stat("Chance of a loss", pct(mc.probability_of_loss_pct)),
+    );
+    c.append(el("small", "st-about", `Monte Carlo: ${mc.simulations} resamples of the ${mc.trades_per_simulation} trades (seed ${mc.seed}). ${mc.method}.`), g);
+  } else c.append(el("p", "st-about", `Monte Carlo: ${mc?.reason || "not available"}.`));
+  if (r.regimes?.length) {
+    c.append(el("small", "st-about", "By market regime at the signal bar (trend: close vs 100-bar SMA; volatility: ATR% vs its median)"));
+    c.append(table(["Regime", { label: "Trades", cls: "num" }, { label: "Win rate", cls: "num" }, { label: "Net P&L", cls: "num" }], r.regimes.map((x) => row([x.regime, td(String(x.trades), "num"), td(pct(x.win_rate), "num"), td(fmtAuto(x.net_pnl), "num " + (x.net_pnl >= 0 ? "up" : "dn"))]))));
+  }
+  const q = r.data.quality;
+  if (q) c.append(el("p", "st-about", `Data quality: ${q.warnings.length ? q.warnings.join("; ") : "no duplicate, out-of-order or missing bars found"}${r.data.repaired_bars ? ` (${r.data.repaired_bars} duplicate bar(s) removed before the run)` : ""}.`));
+  const rp = r.reproducibility;
+  c.append(el("p", "st-about", `Reproducible: engine ${rp.engine_version} · data ${rp.dataset_hash.slice(0, 12)}… · strategy ${rp.strategy_hash.slice(0, 12)}… · same inputs give the same results.`));
+  if (r.saved_id) {
+    c.append(
+      button("Download trades (CSV)", "btn ghost sm", async () => {
+        const res = await fetch(`/api/backtests/${r.saved_id}/trades.csv`, { headers: { "X-ZB-Token": document.querySelector('meta[name="zb-token"]').content } });
+        const url = URL.createObjectURL(await res.blob());
+        const a = el("a");
+        a.href = url;
+        a.download = `backtest-${r.saved_id}.csv`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }),
+    );
+  }
+  return c;
 }
 
 function winLoss(r) {
@@ -296,8 +335,29 @@ function optimizer(s, req) {
       go.disabled = false;
     }
   });
+  const folds = input(4, { type: "number", min: 2, max: 8, step: 1 });
+  g.append(field("Walk-forward folds", folds));
+  const wf = button("Run walk-forward", "btn ghost", async () => {
+    const chosen = rows.filter((r) => r.cb.checked);
+    if (!chosen.length) return say(msg, "Tick at least one parameter.", "err");
+    const axes = chosen.map((r) => ({ path: r.p.path, values: r.vals.value.split(/[,\s]+/).filter(Boolean).map(Number) }));
+    say(msg, "Walking forward…");
+    wf.disabled = true;
+    try {
+      const res = await post("/api/backtest/walkforward", { ...req(), params: axes, objective: obj.value, folds: Number(folds.value) });
+      say(msg, `Walk-forward done. Out-of-sample: ${pct(res.out_of_sample_return_pct)} over ${res.out_of_sample_trades} trades.`, "ok");
+      out.replaceChildren(
+        el("p", "st-about", res.note),
+        table(["Fold", "Trained to", "Tested", "Chosen", { label: "OOS return", cls: "num" }, { label: "OOS trades", cls: "num" }], res.folds.map((f) => row([String(f.fold), when(f.train.to), `${when(f.test.from)} → ${when(f.test.to)}`, td(Object.entries(f.chosen).map(([k, v]) => `${k.split("/").slice(-2).join(".")}=${v}`).join(" "), "notes"), td(pct(f.out_of_sample.return_pct), "num " + (f.out_of_sample.return_pct >= 0 ? "up" : "dn")), td(String(f.out_of_sample.trades), "num")]))),
+      );
+    } catch (e) {
+      say(msg, e.message, "err");
+    } finally {
+      wf.disabled = false;
+    }
+  });
   const bar = el("div", "st-actions");
-  bar.append(go, msg);
+  bar.append(go, wf, msg);
   d.append(list, g, bar, out);
   return d;
 }

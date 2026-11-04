@@ -5,6 +5,7 @@ import { CATALOG, CHECKED } from "./catalog.js";
 import * as builder from "./builder.js";
 import * as backtest from "./backtest.js";
 import * as mybots from "./mybots.js";
+import * as replay from "./replay.js";
 
 const TABS = [
   ["explore", "Explore Bots"],
@@ -12,6 +13,7 @@ const TABS = [
   ["create", "Create Bot"],
   ["library", "Strategy Library"],
   ["backtest", "Backtesting"],
+  ["replay", "Market Replay"],
   ["perf", "Bot Performance"],
 ];
 const KEY = "zoneboard.studio.tab";
@@ -82,6 +84,7 @@ export function wire() {
   builder.init(ctx);
   backtest.init(ctx);
   mybots.init(ctx);
+  replay.init(ctx);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && !$("#botsView").hidden) refresh(false);
   });
@@ -143,12 +146,14 @@ function go(id) {
 function paint() {
   const body = $("#stBody");
   if (!ctx.library) return;
+  if (tab !== "replay") replay.stopReplay();
   body.dataset.tab = tab;
   if (tab === "explore") body.replaceChildren(explore());
   else if (tab === "mine") mybots.renderMine(body, ctx.risk);
   else if (tab === "create") builder.render(body);
   else if (tab === "library") body.replaceChildren(library());
   else if (tab === "backtest") backtest.render(body);
+  else if (tab === "replay") replay.render(body);
   else if (tab === "perf") mybots.renderPerf(body);
 }
 

@@ -396,6 +396,8 @@ pub fn create(conn: &mut Connection, body: &Value) -> Result<i64, BotError> {
         ],
     )?;
     let id = tx.last_insert_rowid();
+    let (vid, _, _) = crate::strategies::publish(&tx, &i.name, &i.spec, &format!("bot {id} created"), "user").map_err(BotError::Invalid)?;
+    tx.execute("UPDATE bots SET strategy_version_id = ?1 WHERE id = ?2", params![vid, id])?;
     crate::audit::record(&tx, "user", "bot_created", &format!("bot:{id}"), &json!({ "bot_id": id, "name": i.name, "market": i.market, "symbol": i.symbol, "interval": i.interval, "allocation": dec_str(i.allocation), "template": i.template, "source": i.source, "mode": "demo" }))?;
     tx.commit()?;
     log(conn, id, "info", "bot created (stopped)");
@@ -425,6 +427,13 @@ pub fn update(conn: &mut Connection, id: i64, body: &Value) -> Result<(), BotErr
     if structural {
         // a new strategy or market starts from a clean engine state
         tx.execute("UPDATE bots SET state = '{}' WHERE id = ?1", [id])?;
+    }
+    if i.spec != b.spec {
+        // editing a strategy publishes a new immutable version under the same strategy; any approval bound to
+        // the old version no longer matches (see approvals.rs)
+        let sname: Option<String> = tx.query_row("SELECT s.name FROM strategy_versions v JOIN strategies s ON s.id = v.strategy_id WHERE v.id = (SELECT strategy_version_id FROM bots WHERE id = ?1)", [id], |r| r.get(0)).optional()?;
+        let (vid, _, _) = crate::strategies::publish(&tx, sname.as_deref().unwrap_or(&i.name), &i.spec, &format!("bot {id} edited"), "user").map_err(BotError::Invalid)?;
+        tx.execute("UPDATE bots SET strategy_version_id = ?1, stage = CASE WHEN stage IN ('live','pending_approval') THEN 'paper' ELSE stage END WHERE id = ?2", params![vid, id])?;
     }
     crate::audit::record(&tx, "user", "bot_updated", &format!("bot:{id}"), &json!({ "bot_id": id, "name": i.name, "allocation": dec_str(i.allocation), "strategy_changed": i.spec != b.spec }))?;
     tx.commit()?;
@@ -690,7 +699,7 @@ pub fn process(conn: &mut Connection, gate: &Gate, id: i64, a: &Frame, b: Option
     let closed_b = fb.map(|f| crate::backtest2::slice(f, 0, closed_len));
     let prep = botengine::prepare(&strat, &Legs { a: &closed_a, b: closed_b.as_ref() })?;
     let legs = Legs { a: fa, b: fb };
-    let engine = Engine { s: &strat, exec: Exec { fee_pct: crate::journal::fee_pct(&bot.market), slippage_pct: bot.slippage_pct, qty_step: [qty_step(&bot.market); 2] } };
+    let engine = Engine { s: &strat, exec: Exec { fee_pct: crate::journal::fee_pct(&bot.market), slippage_pct: bot.slippage_pct, qty_step: [qty_step(&bot.market); 2], max_volume_pct: None } };
     // no new entries on stale data (exits and stops still run)
     let stale = crate::marketdata::check(&crate::backtest2::slice(fa, 0, closed_len), &bot.market, iv, now).stale;
     if stale && bot.status == "running" {
@@ -819,6 +828,12 @@ pub fn to_json(conn: &Connection, b: &Bot, with_perf: bool) -> Result<Value, Bot
         "grid_lines": b.state.engine.grid_lines,
         "virtual": true,
     });
+    let (vid, stage): (Option<i64>, String) = conn.query_row("SELECT strategy_version_id, stage FROM bots WHERE id = ?1", [b.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    v["stage"] = json!(stage);
+    v["strategy_version"] = match vid {
+        Some(id) => crate::strategies::version(conn, id).map_err(BotError::Db)?.map(|x| json!({ "id": x["id"], "name": x["name"], "version": x["version"], "hash": x["hash"] })).unwrap_or(Value::Null),
+        None => Value::Null,
+    };
     if with_perf {
         v["performance"] = performance(conn, b)?;
     }

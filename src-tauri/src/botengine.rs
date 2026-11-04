@@ -116,6 +116,9 @@ pub struct Exec {
     pub slippage_pct: f64,
     /// Quantity step of each leg: 1 for NSE shares, 0.000001 for crypto.
     pub qty_step: [f64; 2],
+    /// Partial-fill model: a market entry fills at most this percent of the bar's volume; the rest is
+    /// cancelled. `None` = unlimited. Exits always fill in full (getting out is never left half done).
+    pub max_volume_pct: Option<f64>,
 }
 
 /// Price bars of the bot's symbol (and the second symbol, aligned bar for bar).
@@ -290,7 +293,14 @@ impl Engine<'_> {
                 Pending::Open { leg, side, stop, target, trail, notional, tag, reason } => {
                     let fill = self.market(side, true, legs.f(leg).o[j]);
                     let stop_d = stop.map(|d| d.of(fill));
-                    let qty = self.qty_for(book, leg, fill, notional, stop_d);
+                    let mut qty = self.qty_for(book, leg, fill, notional, stop_d);
+                    if let Some(p) = self.exec.max_volume_pct {
+                        let cap = floor_step(legs.f(leg).v[j] * p / 100.0, self.exec.qty_step[leg as usize]);
+                        if qty > cap {
+                            book.log("warn", format!("{reason}: partial fill, {cap} of {qty} ({p}% of the bar's volume); the rest is cancelled"));
+                            qty = cap;
+                        }
+                    }
                     if qty <= 0.0 {
                         book.log("warn", format!("{reason}: skipped, the order size rounds to zero with the capital left"));
                         continue;

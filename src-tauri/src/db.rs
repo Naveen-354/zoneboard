@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 /// The latest schema version supported by this application.
-pub const CURRENT_VERSION: u32 = 6;
+pub const CURRENT_VERSION: u32 = 7;
 
 /// Database error type covering schema version mismatches, SQLite errors, and IO issues.
 #[derive(Debug)]
@@ -359,6 +359,108 @@ pub fn migrate(conn: &mut Connection) -> Result<(), DbError> {
             ALTER TABLE accounts ADD COLUMN last_sync_utc TEXT;
             ALTER TABLE accounts ADD COLUMN last_error TEXT;
             PRAGMA user_version = 6;",
+        )?;
+        tx.commit()?;
+        ver = 6;
+    }
+
+    if ver < 7 {
+        let tx = conn.transaction()?;
+        // Migration 7: immutable strategy versions, bot lifecycle stage and order idempotency, live-deployment
+        // approvals, AI proposals and their audit, scoped developer tokens (hash only), scan history and worker
+        // heartbeats. Additive only; existing rows keep their meaning.
+        tx.execute_batch(
+            "CREATE TABLE strategies (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 60),
+                created_utc TEXT NOT NULL
+            );
+            CREATE TABLE strategy_versions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_id INTEGER NOT NULL REFERENCES strategies(id),
+                version     INTEGER NOT NULL,
+                spec        TEXT NOT NULL,
+                hash        TEXT NOT NULL,
+                note        TEXT NOT NULL DEFAULT '',
+                created_utc TEXT NOT NULL,
+                UNIQUE (strategy_id, version),
+                UNIQUE (strategy_id, hash)
+            );
+            CREATE TRIGGER strategy_versions_immutable_update BEFORE UPDATE ON strategy_versions
+              BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable: publish a new version'); END;
+            CREATE TRIGGER strategy_versions_immutable_delete BEFORE DELETE ON strategy_versions
+              BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END;
+            ALTER TABLE bots ADD COLUMN strategy_version_id INTEGER;
+            ALTER TABLE bots ADD COLUMN stage TEXT NOT NULL DEFAULT 'draft';
+            ALTER TABLE bot_orders ADD COLUMN client_order_id TEXT;
+            ALTER TABLE bot_orders ADD COLUMN broker_order_id TEXT;
+            ALTER TABLE bot_orders ADD COLUMN environment TEXT;
+            CREATE UNIQUE INDEX idx_bot_orders_client_id ON bot_orders(client_order_id) WHERE client_order_id IS NOT NULL AND status = 'filled';
+            ALTER TABLE backtests ADD COLUMN strategy_version_id INTEGER;
+            ALTER TABLE backtests ADD COLUMN engine_version TEXT;
+            ALTER TABLE backtests ADD COLUMN dataset_hash TEXT;
+            CREATE TABLE approvals (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id        INTEGER NOT NULL,
+                strategy_version_id INTEGER NOT NULL,
+                spec_hash     TEXT NOT NULL,
+                account_id    TEXT NOT NULL,
+                scope         TEXT NOT NULL,
+                requested_by  TEXT NOT NULL,
+                requested_utc TEXT NOT NULL,
+                expires_utc   TEXT NOT NULL,
+                status        TEXT NOT NULL CHECK (status IN ('pending','approved','rejected','revoked','expired')),
+                decided_by    TEXT,
+                decided_utc   TEXT,
+                reason        TEXT,
+                evidence      TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX idx_approvals_bot ON approvals(bot_id, id);
+            CREATE TABLE ai_proposals (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_utc  TEXT NOT NULL,
+                provider     TEXT NOT NULL,
+                model        TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                objective    TEXT NOT NULL,
+                output       TEXT NOT NULL,
+                spec         TEXT,
+                valid        INTEGER NOT NULL DEFAULT 0,
+                errors       TEXT,
+                status       TEXT NOT NULL DEFAULT 'draft'
+            );
+            CREATE TABLE ai_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_utc      TEXT NOT NULL,
+                proposal_id INTEGER,
+                kind        TEXT NOT NULL,
+                detail      TEXT NOT NULL
+            );
+            CREATE TABLE api_tokens (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL,
+                scopes       TEXT NOT NULL,
+                token_hash   TEXT NOT NULL UNIQUE,
+                hint         TEXT NOT NULL,
+                created_utc  TEXT NOT NULL,
+                last_used_utc TEXT,
+                revoked_utc  TEXT
+            );
+            CREATE TABLE scan_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_utc TEXT NOT NULL,
+                template    TEXT NOT NULL,
+                request     TEXT NOT NULL,
+                results     TEXT NOT NULL
+            );
+            CREATE TABLE workers (
+                name          TEXT PRIMARY KEY,
+                started_utc   TEXT NOT NULL,
+                heartbeat_utc TEXT NOT NULL,
+                detail        TEXT NOT NULL DEFAULT '{}'
+            );
+            PRAGMA user_version = 7;",
         )?;
         tx.commit()?;
     }

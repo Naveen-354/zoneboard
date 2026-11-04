@@ -21,6 +21,7 @@ pub mod orders;
 pub mod risk;
 pub mod server;
 pub mod settings;
+pub mod strategies;
 pub mod strategy;
 pub mod timezones;
 pub mod vault;

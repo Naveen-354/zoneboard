@@ -328,6 +328,13 @@ const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/api/bots/{id}/live", "/api/bots/999999/live", None),
     ("POST", "/api/bots/{id}/deploy-live", "/api/bots/999999/deploy-live", None),
     ("GET", "/api/strategies/library", "/api/strategies/library", None),
+    ("POST", "/api/backtest/walkforward", "/api/backtest/walkforward", Some(r#"{"symbol":"BTCUSDT"}"#)),
+    ("GET", "/api/backtests/{id}/trades.csv", "/api/backtests/999999/trades.csv", None),
+    ("GET", "/api/strategies", "/api/strategies", None),
+    ("POST", "/api/strategies", "/api/strategies", Some(r#"{"name":"x"}"#)),
+    ("POST", "/api/strategies/import", "/api/strategies/import", Some(r#"{}"#)),
+    ("GET", "/api/strategies/{id}/versions", "/api/strategies/999999/versions", None),
+    ("GET", "/api/strategy-versions/{id}/export", "/api/strategy-versions/999999/export", None),
     ("GET", "/api/market-data/health", "/api/market-data/health?market=crypto&symbol=BTCUSDT&interval=1h", None),
     ("DELETE", "/api/accounts/{id}", "/api/accounts/demo-1", None),
     ("GET", "/api/accounts/{id}/balances", "/api/accounts/demo-1/balances", None),
@@ -1053,6 +1060,26 @@ async fn bot_studio_flow() {
     assert!(bt["data"]["source"].as_str().unwrap().contains("SAMPLE"));
     assert!(bt["metrics"]["trades"].is_u64() && bt["candles"].as_array().unwrap().len() > 100);
     let saved = bt["saved_id"].as_i64().unwrap();
+    assert_eq!(bt["reproducibility"]["engine_version"], "botengine-2");
+    assert_eq!(bt["reproducibility"]["dataset_hash"].as_str().unwrap().len(), 64);
+    assert!(bt["regimes"].is_array() && bt["monte_carlo"].is_object());
+    // same request, same answer (reproducible)
+    let (_, bt2) = send(&r, "POST", "/api/backtest", Some(json!({ "bot_id": id, "bars": 500 }))).await;
+    assert_eq!(bt2["metrics"], bt["metrics"]);
+    assert_eq!(bt2["reproducibility"], bt["reproducibility"]);
+    let (s, _, csv) = call(&r, "GET", &format!("/api/backtests/{saved}/trades.csv"), "localhost", None, &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&csv).starts_with("leg,side,tag,qty"));
+    // the bot is pinned to an exact strategy version; export / import round-trips it
+    let vid = bot["strategy_version"]["id"].as_i64().unwrap();
+    let (s, doc) = send(&r, "GET", &format!("/api/strategy-versions/{vid}/export"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, imp) = send(&r, "POST", "/api/strategies/import", Some(doc)).await;
+    assert_eq!(s, StatusCode::CREATED, "{imp}");
+    assert_eq!(imp["version_id"].as_i64(), Some(vid), "same content, same version");
+    let (s, wf) = send(&r, "POST", "/api/backtest/walkforward", Some(json!({ "bot_id": id, "bars": 800, "folds": 3, "objective": "return", "params": [{ "path": "/indicators/0/params/period", "values": [5, 9] }] }))).await;
+    assert_eq!(s, StatusCode::OK, "{wf}");
+    assert_eq!(wf["folds"].as_array().unwrap().len(), 3);
     assert_eq!(get_json(&r, &format!("/api/backtests/{saved}")).await.0, StatusCode::OK);
     assert_eq!(get_json(&r, &format!("/api/bots/{id}/backtests")).await.1["backtests"].as_array().unwrap().len(), 1);
 

@@ -279,7 +279,7 @@ fn bt_request(s: &Shared, b: &Value) -> Result<BtReq, Response> {
         symbol2,
         interval,
         bars,
-        cfg: Config { capital, fee_pct, slippage_pct, qty_step: [bots::qty_step(&market); 2], trade_from: 0 },
+        cfg: Config { capital, fee_pct, slippage_pct, qty_step: [bots::qty_step(&market); 2], trade_from: 0, max_volume_pct: num("max_volume_pct", 0.0, 0.0, 100.0).map(|x| (x > 0.0).then_some(x))? },
         bot_id: bot.as_ref().map(|b| b.id),
         save: m.get("save").and_then(Value::as_bool).unwrap_or(false),
         sample,
@@ -372,9 +372,16 @@ pub async fn backtest_run(State(s): State<Shared>, headers: HeaderMap, body: axu
     let candles: Vec<Value> = (0..fa.len()).map(|i| json!([fa.t[i], fa.o[i], fa.h[i], fa.l[i], fa.c[i]])).collect();
     let data = json!({ "source": source_label(&r), "sample": r.sample, "market": r.market, "symbol": r.symbol, "symbol2": r.symbol2, "interval": r.interval, "bars": fa.len(), "from": fa.t.first(), "to": fa.t.last(), "quality": q, "repaired_bars": removed });
     let request = json!({ "market": r.market, "symbol": r.symbol, "symbol2": r.symbol2, "interval": r.interval, "bars": r.bars, "capital": r.cfg.capital, "fee_pct": r.cfg.fee_pct, "slippage_pct": r.cfg.slippage_pct, "sample": r.sample, "spec": r.spec });
+    let ds_hash = backtest2::dataset_hash(&fa);
+    let strategy_hash = crate::strategies::hash(&r.spec);
+    let pnls: Vec<f64> = report.trades.iter().filter_map(|t| t.pnl.parse().ok()).collect();
+    let mc = backtest2::monte_carlo(&pnls, r.cfg.capital, 1000, 42);
+    let regimes = backtest2::regimes(&fa, &report.trades);
+    let repro = json!({ "engine_version": backtest2::ENGINE_VERSION, "dataset_hash": ds_hash, "strategy_hash": strategy_hash, "monte_carlo_seed": 42, "cost_model": { "fee_pct_per_side": r.cfg.fee_pct, "slippage_pct": r.cfg.slippage_pct, "max_volume_pct": r.cfg.max_volume_pct } });
     let mut saved = None;
     if r.save {
         let stored = json!({
+            "reproducibility": repro, "monte_carlo": mc, "regimes": regimes,
             "metrics": report.metrics,
             "trades": report.trades.iter().take(MAX_SAVED_TRADES).collect::<Vec<_>>(),
             "equity": thin(&report.equity, MAX_SAVED_EQUITY),
@@ -382,9 +389,11 @@ pub async fn backtest_run(State(s): State<Shared>, headers: HeaderMap, body: axu
         });
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let res = s.journal.with_conn(|c| -> rusqlite::Result<i64> {
+            let name = r.bot_id.and_then(|b| bots::load(c, b).ok()).map(|b| b.name).unwrap_or_else(|| "Backtest drafts".into());
+            let vid = crate::strategies::publish(c, &name, &r.spec, "backtested", "user").ok().map(|v| v.0);
             c.execute(
-                "INSERT INTO backtests (bot_id, created_utc, request, metrics, report) VALUES (?1,?2,?3,?4,?5)",
-                params![r.bot_id, now, request.to_string(), serde_json::to_string(&report.metrics).unwrap(), stored.to_string()],
+                "INSERT INTO backtests (bot_id, created_utc, request, metrics, report, strategy_version_id, engine_version, dataset_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![r.bot_id, now, request.to_string(), serde_json::to_string(&report.metrics).unwrap(), stored.to_string(), vid, backtest2::ENGINE_VERSION, ds_hash],
             )?;
             let id = c.last_insert_rowid();
             if let Some(bid) = r.bot_id {
@@ -403,6 +412,9 @@ pub async fn backtest_run(State(s): State<Shared>, headers: HeaderMap, body: axu
     out["overlays"] = overlays(&st, &fa);
     out["data"] = data;
     out["saved_id"] = json!(saved);
+    out["reproducibility"] = repro;
+    out["monte_carlo"] = mc;
+    out["regimes"] = regimes;
     out["assumptions"] = json!(format!(
         "Signals on candle close, fills at the next open. Fees {}% per side, slippage {}% on market fills. Stop before target inside one candle. Open positions at the end are marked to the last close but not counted as trades.",
         r.cfg.fee_pct, r.cfg.slippage_pct
@@ -592,4 +604,93 @@ pub async fn market_health(State(s): State<Shared>, Query(q): Query<HashMap<Stri
         }
         Err(e) => err(StatusCode::BAD_GATEWAY, &format!("market data: {e}")),
     }
+}
+
+/// `POST /api/backtest/walkforward`: the backtest request plus `params` (as optimise) and `folds`.
+pub async fn backtest_walkforward(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    let r = match bt_request(&s, &b) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if r.symbol2.is_some() {
+        return err(StatusCode::BAD_REQUEST, "walk-forward supports single-symbol strategies");
+    }
+    let axes: Vec<Axis> = match b.get("params").and_then(Value::as_array) {
+        Some(list) => list.iter().filter_map(|p| Some(Axis { path: p.get("path")?.as_str()?.to_string(), values: p.get("values")?.as_array()?.clone() })).collect(),
+        None => return err(StatusCode::BAD_REQUEST, "params must be a list of {path, values}"),
+    };
+    if axes.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "give at least one parameter");
+    }
+    let folds = b.get("folds").and_then(Value::as_u64).unwrap_or(4) as usize;
+    let objective = b.get("objective").and_then(Value::as_str).unwrap_or("sharpe").to_string();
+    let (fa, _) = match frames(&s, &r).await {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let fa = Arc::new(crate::marketdata::repair(&fa).0);
+    let (spec, cfg) = (r.spec.clone(), r.cfg);
+    match tokio::task::spawn_blocking(move || backtest2::walk_forward(&spec, &axes, &fa, &cfg, folds, &objective)).await {
+        Ok(Ok(mut v)) => {
+            v["data"] = json!({ "source": source_label(&r), "sample": r.sample, "symbol": r.symbol, "interval": r.interval });
+            Json(v).into_response()
+        }
+        Ok(Err(e)) => err(StatusCode::BAD_REQUEST, &e),
+        Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "walk-forward crashed"),
+    }
+}
+
+/// `GET /api/backtests/{id}/trades.csv`: every stored trade of a saved backtest.
+pub async fn backtest_csv(State(s): State<Shared>, Path(id): Path<i64>) -> Response {
+    let rep: Result<String, _> = s.journal.with_conn(|c| c.query_row("SELECT report FROM backtests WHERE id = ?1", [id], |r| r.get(0)));
+    let Ok(rep) = rep else { return err(StatusCode::NOT_FOUND, "no such backtest") };
+    let v: Value = serde_json::from_str(&rep).unwrap_or(Value::Null);
+    let mut out = String::from("leg,side,tag,qty,entry_time_utc,entry,exit_time_utc,exit,fees,pnl,reason,bars\n");
+    let iso = |t: i64| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()).unwrap_or_default();
+    // fields are numbers or our own fixed words; quote the free-text ones anyway
+    let q = |x: &str| format!("\"{}\"", x.replace('"', "\"\""));
+    for t in v["trades"].as_array().cloned().unwrap_or_default() {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            t["leg"], q(t["side"].as_str().unwrap_or("")), q(t["tag"].as_str().unwrap_or("")), t["qty"], iso(t["entry_time"].as_i64().unwrap_or(0)), t["entry"],
+            iso(t["exit_time"].as_i64().unwrap_or(0)), t["exit"], t["fees"].as_str().unwrap_or(""), t["pnl"].as_str().unwrap_or(""), q(t["reason"].as_str().unwrap_or("")), t["bars"]
+        ));
+    }
+    ([(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"), (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"backtest.csv\"")], out).into_response()
+}
+
+// ------------------------------------------------------------------ strategy registry
+
+fn sv<T: serde::Serialize>(r: Result<T, String>, ok: StatusCode) -> Response {
+    match r {
+        Ok(v) => (ok, Json(json!(v))).into_response(),
+        Err(e) if e.starts_with("no such") => err(StatusCode::NOT_FOUND, &e),
+        Err(e) => err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+pub async fn strategies_list(State(s): State<Shared>) -> Response {
+    sv(s.journal.with_conn(|c| crate::strategies::list(c)), StatusCode::OK)
+}
+
+pub async fn strategies_publish(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let note = b.get("note").and_then(Value::as_str).unwrap_or("").to_string();
+    let spec = b.get("spec").cloned().unwrap_or(Value::Null);
+    sv(s.journal.with_conn(|c| crate::strategies::publish(c, &name, &spec, &note, "user").map(|(id, v, h)| json!({ "version_id": id, "version": v, "hash": h }))), StatusCode::CREATED)
+}
+
+pub async fn strategy_versions(State(s): State<Shared>, Path(id): Path<i64>) -> Response {
+    sv(s.journal.with_conn(|c| crate::strategies::versions(c, id)), StatusCode::OK)
+}
+
+pub async fn strategy_export(State(s): State<Shared>, Path(id): Path<i64>) -> Response {
+    sv(s.journal.with_conn(|c| crate::strategies::export(c, id)), StatusCode::OK)
+}
+
+pub async fn strategies_import(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    sv(s.journal.with_conn(|c| crate::strategies::import(c, &b)), StatusCode::CREATED)
 }

@@ -125,7 +125,12 @@ pub struct Config {
     pub qty_step: [f64; 2],
     /// First bar on which new positions may be opened (earlier bars only warm up indicators).
     pub trade_from: usize,
+    /// Partial-fill model (percent of bar volume an entry may take), `None` = unlimited.
+    pub max_volume_pct: Option<f64>,
 }
+
+/// Bumped whenever a change to the engine can change a result, and stored with every saved run.
+pub const ENGINE_VERSION: &str = "botengine-2";
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Metrics {
@@ -185,7 +190,7 @@ pub fn run(s: &Strategy, a: &Frame, b: Option<&Frame>, cfg: &Config) -> Result<R
     }
     let legs = Legs { a: fa, b: fb };
     let prep = botengine::prepare(s, &legs)?;
-    let engine = Engine { s, exec: Exec { fee_pct: cfg.fee_pct, slippage_pct: cfg.slippage_pct, qty_step: cfg.qty_step } };
+    let engine = Engine { s, exec: Exec { fee_pct: cfg.fee_pct, slippage_pct: cfg.slippage_pct, qty_step: cfg.qty_step, max_volume_pct: cfg.max_volume_pct } };
     let mut book = SimBook { capital0: dec(cfg.capital), realised: Decimal::ZERO, fee_pct: cfg.fee_pct, lots: vec![], next_id: 0, trades: vec![], log: vec![], pnl_f: vec![], times: fa.t.clone() };
     let mut st = State::default();
     let mut equity = Vec::with_capacity(fa.len());
@@ -407,6 +412,144 @@ pub fn slice(f: &Frame, from: usize, to: usize) -> Frame {
     out
 }
 
+/// SHA-256 over every bar's time and prices: two runs on the same data share this hash.
+pub fn dataset_hash(f: &Frame) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for i in 0..f.len() {
+        h.update(f.t[i].to_le_bytes());
+        for x in [f.o[i], f.h[i], f.l[i], f.c[i], f.v[i]] {
+            h.update(x.to_bits().to_le_bytes());
+        }
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn pctile(v: &mut [f64], p: f64) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let k = ((v.len() - 1) as f64 * p).round() as usize;
+    v[k]
+}
+
+/// Bootstrap the trade results: `n` simulations, each drawing as many trades as the backtest had, with
+/// replacement, in random order. Seeded, so the same seed gives the same numbers. Shows how much of the result
+/// is the luck of the order and draw; it assumes trades are independent, which they may not be.
+pub fn monte_carlo(pnls: &[f64], capital: f64, n: usize, seed: u64) -> Value {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    if pnls.len() < 5 {
+        return json!({ "available": false, "reason": "fewer than 5 trades: too few to resample" });
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let (mut rets, mut dds) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut losses = 0usize;
+    for _ in 0..n {
+        let (mut eq, mut peak, mut dd) = (capital, capital, 0.0f64);
+        for _ in 0..pnls.len() {
+            eq += pnls[rng.gen_range(0..pnls.len())];
+            peak = peak.max(eq);
+            if peak > 0.0 {
+                dd = dd.max((peak - eq) / peak);
+            }
+        }
+        if eq < capital {
+            losses += 1;
+        }
+        rets.push((eq / capital - 1.0) * 100.0);
+        dds.push(dd * 100.0);
+    }
+    let q = |v: &mut Vec<f64>| json!({ "p5": r(pctile(v, 0.05), 3), "p50": r(pctile(v, 0.5), 3), "p95": r(pctile(v, 0.95), 3) });
+    json!({
+        "available": true, "simulations": n, "seed": seed, "trades_per_simulation": pnls.len(),
+        "return_pct": q(&mut rets), "max_drawdown_pct": q(&mut dds),
+        "probability_of_loss_pct": r(losses as f64 / n as f64 * 100.0, 2),
+        "method": "bootstrap of closed-trade P&L with replacement; assumes independent trades",
+    })
+}
+
+/// Results split by the market's state when each trade was signalled (the bar before entry): trend (close vs
+/// its 100-bar SMA) and volatility (ATR(14) as a share of price, above or below its median over the run).
+pub fn regimes(f: &Frame, trades: &[BtTrade]) -> Value {
+    let sma = crate::indicators::sma(&f.c, 100);
+    let atr = crate::indicators::atr(f, 14);
+    let atrp: Vec<f64> = (0..f.len()).map(|i| atr[i] / f.c[i]).collect();
+    let mut finite: Vec<f64> = atrp.iter().copied().filter(|x| x.is_finite()).collect();
+    let med = pctile(&mut finite, 0.5);
+    let mut buckets: std::collections::BTreeMap<String, (usize, usize, f64)> = Default::default();
+    for t in trades.iter().filter(|t| t.leg == 0) {
+        let i = f.t.partition_point(|&x| x < t.entry_time).saturating_sub(1);
+        let trend = if !sma[i].is_finite() { "warm-up" } else if f.c[i] > sma[i] { "uptrend" } else { "downtrend" };
+        let vol = if !atrp[i].is_finite() || !med.is_finite() { "n/a" } else if atrp[i] > med { "high volatility" } else { "low volatility" };
+        let p: f64 = t.pnl.parse().unwrap_or(0.0);
+        for k in [trend.to_string(), vol.to_string()] {
+            let e = buckets.entry(k).or_default();
+            e.0 += 1;
+            e.1 += (p > 0.0) as usize;
+            e.2 += p;
+        }
+    }
+    Value::Array(buckets.into_iter().map(|(k, (n, w, p))| json!({ "regime": k, "trades": n, "win_rate": r(w as f64 / n as f64 * 100.0, 2), "net_pnl": r(p, 8) })).collect())
+}
+
+/// Anchored walk-forward: split history into `folds + 1` blocks; for each fold choose parameters on all
+/// blocks before it (in-sample) and trade the next block with them (out-of-sample, indicators warm). The
+/// stitched out-of-sample results are the honest estimate of the optimised strategy.
+pub fn walk_forward(spec: &Value, axes: &[Axis], a: &Frame, cfg: &Config, folds: usize, objective: &str) -> Result<Value, String> {
+    if !(2..=8).contains(&folds) {
+        return Err("folds must be 2 to 8".into());
+    }
+    let total: usize = axes.iter().map(|x| x.values.len().max(1)).product();
+    if total * folds > 400 {
+        return Err(format!("{} runs (combinations x folds); at most 400", total * folds));
+    }
+    let n = a.len();
+    let block = n / (folds + 1);
+    if block < 50 {
+        return Err("not enough bars: each fold needs at least 50".into());
+    }
+    let mut rows = vec![];
+    let mut oos_pnl = 0.0;
+    let mut oos_trades = 0usize;
+    for k in 1..=folds {
+        let (train_end, test_end) = (k * block, if k == folds { n } else { (k + 1) * block });
+        let ins = slice(a, 0, train_end);
+        let mut best: Option<(f64, Value, Strategy)> = None;
+        let mut idx = vec![0usize; axes.len()];
+        for _ in 0..total {
+            let mut v = spec.clone();
+            let mut chosen = serde_json::Map::new();
+            for (q, ax) in axes.iter().enumerate() {
+                *v.pointer_mut(&ax.path).ok_or_else(|| format!("{} is not a field of this strategy", ax.path))? = ax.values[idx[q]].clone();
+                chosen.insert(ax.path.clone(), ax.values[idx[q]].clone());
+            }
+            for q in (0..axes.len()).rev() {
+                idx[q] += 1;
+                if idx[q] < axes[q].values.len() {
+                    break;
+                }
+                idx[q] = 0;
+            }
+            let Ok(st) = strategy::parse(&v) else { continue };
+            let m = run(&st, &ins, None, &Config { trade_from: 0, ..*cfg })?.metrics;
+            let sc = score(&m, objective);
+            if best.as_ref().is_none_or(|b| sc > b.0) {
+                best = Some((sc, Value::Object(chosen), st));
+            }
+        }
+        let Some((sc, params, st)) = best else { return Err("no valid parameter combination".into()) };
+        let test = slice(a, 0, test_end);
+        let oos = run(&st, &test, None, &Config { trade_from: train_end, ..*cfg })?;
+        let p: f64 = oos.metrics.net_profit.parse().unwrap_or(0.0);
+        oos_pnl += p;
+        oos_trades += oos.metrics.trades;
+        rows.push(json!({ "fold": k, "train": { "from": a.t[0], "to": a.t[train_end - 1] }, "test": { "from": a.t[train_end], "to": a.t[test_end - 1] }, "chosen": params, "in_sample_score": if sc.is_finite() { json!(sc) } else { Value::Null }, "out_of_sample": oos.metrics }));
+    }
+    Ok(json!({ "folds": rows, "objective": objective, "combinations": total, "out_of_sample_net_pnl": r(oos_pnl, 8), "out_of_sample_return_pct": r(oos_pnl / cfg.capital * 100.0, 3), "out_of_sample_trades": oos_trades,
+        "note": "Each fold's parameters were chosen only on data before it. Summed out-of-sample P&L is the estimate to trust; the parameters changing a lot between folds is a sign of overfitting." }))
+}
+
 pub fn report_json(r: &Report) -> Value {
     json!({ "metrics": r.metrics, "trades": r.trades, "equity": r.equity, "log": r.log, "open_lots": r.open_lots })
 }
@@ -417,7 +560,7 @@ mod tests {
     use serde_json::json;
 
     fn cfg() -> Config {
-        Config { capital: 10_000.0, fee_pct: 0.0, slippage_pct: 0.0, qty_step: [0.000001, 0.000001], trade_from: 0 }
+        Config { capital: 10_000.0, fee_pct: 0.0, slippage_pct: 0.0, qty_step: [0.000001, 0.000001], trade_from: 0, max_volume_pct: None }
     }
 
     fn bars(rows: &[(f64, f64, f64, f64)]) -> Frame {
@@ -592,6 +735,53 @@ mod tests {
         let first_b = r.trades.iter().find(|t| t.leg == 1).unwrap();
         assert_ne!(first_a.side, first_b.side);
         assert_eq!(first_a.entry_time, first_b.entry_time);
+    }
+
+    #[test]
+    fn same_inputs_give_identical_results_and_hash() {
+        let a = walk(600, 31);
+        let s = strategy::parse(&strategy::templates().into_iter().find(|t| t["id"] == "ema_cross").unwrap()["spec"]).unwrap();
+        let x = run(&s, &a, None, &cfg()).unwrap();
+        let y = run(&s, &a, None, &cfg()).unwrap();
+        assert_eq!(serde_json::to_string(&report_json(&x)).unwrap(), serde_json::to_string(&report_json(&y)).unwrap());
+        assert_eq!(dataset_hash(&a), dataset_hash(&a.clone()));
+        let mut b = a.clone();
+        b.c[10] += 0.01;
+        assert_ne!(dataset_hash(&a), dataset_hash(&b));
+        let p: Vec<f64> = x.trades.iter().map(|t| t.pnl.parse().unwrap()).collect();
+        assert_eq!(monte_carlo(&p, 10_000.0, 300, 7), monte_carlo(&p, 10_000.0, 300, 7), "seeded Monte Carlo is reproducible");
+        assert_ne!(monte_carlo(&p, 10_000.0, 300, 7), monte_carlo(&p, 10_000.0, 300, 8));
+    }
+
+    #[test]
+    fn partial_fills_are_capped_by_bar_volume() {
+        let s = always_long(json!({ "sizing": { "type": "fixed_qty", "value": 50 } }));
+        let f = bars(&[(100.0, 100.0, 100.0, 100.0), (100.0, 101.0, 100.0, 101.0), (100.0, 100.5, 99.5, 100.0), (100.0, 100.0, 100.0, 100.0)]);
+        // every bar has volume 1000: 2% of it is 20
+        let r = run(&s, &f, None, &Config { max_volume_pct: Some(2.0), ..cfg() }).unwrap();
+        assert_eq!(r.open_lots, 1);
+        assert!(r.log.iter().any(|l| l["msg"].as_str().unwrap().contains("partial fill, 20 of 50")), "{:?}", r.log);
+    }
+
+    #[test]
+    fn walk_forward_chooses_on_the_past_only() {
+        let a = walk(900, 41);
+        let spec = strategy::templates().into_iter().find(|t| t["id"] == "ema_cross").unwrap()["spec"].clone();
+        let axes = vec![Axis { path: "/indicators/0/params/period".into(), values: vec![json!(5), json!(9)] }];
+        let wf = walk_forward(&spec, &axes, &a, &cfg(), 3, "return").unwrap();
+        let folds = wf["folds"].as_array().unwrap();
+        assert_eq!(folds.len(), 3);
+        for f in folds {
+            assert!(f["train"]["to"].as_i64() < f["test"]["from"].as_i64(), "test data starts after the training data");
+        }
+        // changing bars after fold 1's test window cannot change fold 1
+        let mut later = a.clone();
+        for i in 450..later.len() {
+            later.c[i] *= 1.5;
+            later.h[i] *= 1.5;
+        }
+        let wf2 = walk_forward(&spec, &axes, &later, &cfg(), 3, "return").unwrap();
+        assert_eq!(wf["folds"][0], wf2["folds"][0]);
     }
 
     #[test]

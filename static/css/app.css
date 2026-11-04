@@ -372,3 +372,7 @@ footer{padding:8px 18px 12px;color:var(--faint);font-size:11.5px}
   .top{padding:10px 12px}
 }
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+/* replay */
+.replay{display:grid;gap:10px}
+.replay-pos{flex:1;min-width:160px}
+.replay-info{font-size:12.5px;color:var(--ink-2)}
