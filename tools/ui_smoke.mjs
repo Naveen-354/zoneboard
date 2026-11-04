@@ -211,7 +211,9 @@ const scenarios = [
     assert(a.badge === "VIRTUAL", `account card badge: ${a.badge}`);
     assert(/10,000/.test(a.text) && /1,000,000/.test(a.text), "default virtual credits not shown");
     assert(/holds no money/.test(a.note), "the 'holds no money' line is missing");
-    assert(a.brokers.length === 2 && a.brokers.every(([t, off]) => /Not connected|NOT CONNECTED/i.test(t) && off), "broker cards must say Not connected with a disabled Connect");
+    assert(a.brokers.length === 2 && a.brokers.every(([t]) => /NOT CONNECTED|NOT BUILT/i.test(t)), "broker cards must say they are not connected");
+    assert(a.brokers[1][1] === true && /FYERS/.test(a.brokers[1][0]), "FYERS connect stays disabled until its connector exists");
+    assert(await p.eval(`document.querySelector('#bnForm [name=api_secret]').type === 'password'`), "the secret field must be a password field");
     // edit credits end to end: the server's validation message and a successful save both reach the page
     await p.eval(`document.querySelector('#acctList .acct-actions button').click()`);
     await p.eval(`(() => { const f = document.querySelector('#acctList .acct-edit'); f.elements.USDT.value = '0.123456789'; f.requestSubmit(); })()`);

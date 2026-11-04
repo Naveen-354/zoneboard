@@ -172,17 +172,27 @@
   </form>
   <h2 class="page-h">Brokers</h2>
   <div class="broker-grid">
-    <article class="card acct broker">
-      <div class="acct-head"><b>Binance</b><span class="tag delay">NOT CONNECTED</span></div>
-      <p>Spot account balances and orders. Arrives with the Binance connector.</p>
-      <button class="btn ghost" type="button" disabled>Connect</button>
+    <article class="card acct broker" id="bnConnect">
+      <div class="acct-head"><b>Binance</b><span class="tag delay" id="bnState">NOT CONNECTED</span></div>
+      <p>Spot balances from your own Binance account. Use a key with <b>Reading</b> (and Spot trading only if you plan to trade), restricted to your IP. A key that can withdraw funds is refused. Start with the <b>Spot Testnet</b> and throwaway keys.</p>
+      <form class="acct-edit bn-form" id="bnForm" autocomplete="off">
+        <label>Environment<select name="environment"><option value="testnet">Spot Testnet (practice keys)</option><option value="live">Live (real account)</option></select></label>
+        <label>Name<input name="label" type="text" maxlength="60" placeholder="Binance Testnet"></label>
+        <label>API key<input name="api_key" type="password" autocomplete="off" spellcheck="false"></label>
+        <label>Secret key<input name="api_secret" type="password" autocomplete="off" spellcheck="false"></label>
+        <label class="set-check" hidden id="bnLive"><input type="checkbox" name="confirm_live"> I am connecting a real account with a read-only, IP-restricted key</label>
+        <button class="btn" type="submit">Connect</button>
+      </form>
+      <p class="acct-msg" id="bnMsg" role="status" aria-live="polite"></p>
+      <small class="jsub">The keys go straight to Windows Credential Manager. They are never stored in ZoneBoard's database, shown again, or sent to this page.</small>
     </article>
     <article class="card acct broker">
-      <div class="acct-head"><b>FYERS</b><span class="tag delay">NOT CONNECTED</span></div>
-      <p>NSE live data and orders. Arrives with the FYERS connector.</p>
+      <div class="acct-head"><b>FYERS</b><span class="tag delay">NOT BUILT YET</span></div>
+      <p>NSE live data and orders. Needs the FYERS connector (docs/fyers/SPEC.md); until then NSE data is Yahoo, about 15 min delayed.</p>
       <button class="btn ghost" type="button" disabled>Connect</button>
     </article>
   </div>
+  <div class="acct-list" id="brokerList"></div>
 </main>
 
 <main class="page" id="settingsView" hidden>

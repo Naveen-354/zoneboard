@@ -139,6 +139,70 @@ function card(a, reload) {
   return c;
 }
 
+/** A connected broker account: REAL balances fetched from the broker, never virtual, never estimated. */
+function brokerCard(a, reload) {
+  const c = el("article", "card acct");
+  c.dataset.account = a.id;
+  const head = el("div", "acct-head");
+  head.append(el("b", null, a.label), el("span", "tag " + (a.environment === "live" ? "live" : "delay"), a.environment === "live" ? "LIVE ACCOUNT" : "TESTNET"), el("small", null, `${a.id} · key ${a.key_hint || "–"} · last sync ${a.last_sync_utc ? new Date(a.last_sync_utc).toLocaleString() : "never"}`));
+  const msg = el("p", "acct-msg");
+  msg.setAttribute("role", "status");
+  const body = el("div");
+  body.append(el("p", "acct-msg", "Loading balances from Binance…"));
+  const actions = el("div", "acct-actions");
+  const btn = (t, fn) => {
+    const b = el("button", "btn ghost", t);
+    b.type = "button";
+    b.addEventListener("click", fn);
+    return b;
+  };
+  const refresh = async () => {
+    try {
+      const r = await api(`/api/accounts/${encodeURIComponent(a.id)}/balances`);
+      const t = el("table", "acct-wallets");
+      const hr = el("tr");
+      for (const h of ["Asset", "Free", "Locked"]) hr.append(el("th", null, h));
+      const th = el("thead");
+      th.append(hr);
+      const tb = el("tbody");
+      for (const x of r.balances) {
+        const tr = el("tr");
+        tr.append(el("td", null, x.asset), el("td", "num", money(x.free)), el("td", "num", money(x.locked)));
+        tb.append(tr);
+      }
+      t.append(th, tb);
+      const w = el("div", "table-wrap");
+      w.append(t);
+      body.replaceChildren(el("small", "jsub", `${r.source} · as of ${new Date(r.as_of).toLocaleTimeString()} · permissions ${r.permissions.join(", ") || "none"}`), r.balances.length ? w : el("p", "acct-msg", "No non-zero balances."));
+    } catch (err) {
+      body.replaceChildren(el("p", "acct-msg err", `Balances unavailable: ${err.message}`));
+    }
+  };
+  actions.append(
+    btn("Refresh", refresh),
+    btn("Verify key", async () => {
+      try {
+        await api(`/api/accounts/${encodeURIComponent(a.id)}/verify`, { method: "POST" });
+        say(msg, "Key verified: it works and cannot withdraw.", "ok");
+      } catch (err) {
+        say(msg, err.message, "err");
+      }
+    }),
+    btn("Disconnect", async () => {
+      if (!confirm(`Disconnect ${a.label}? Its keys are deleted from the vault; its history stays.`)) return;
+      try {
+        await api(`/api/accounts/${encodeURIComponent(a.id)}`, { method: "DELETE" });
+        await reload("Disconnected.");
+      } catch (err) {
+        say(msg, err.message, "err");
+      }
+    }),
+  );
+  c.append(head, body, actions, msg);
+  refresh();
+  return c;
+}
+
 export async function load(note) {
   const list = $("#acctList");
   const reload = (text) => load(text);
@@ -150,15 +214,39 @@ export async function load(note) {
     return;
   }
   onLoad(d);
-  list.replaceChildren(...d.accounts.map((a) => card(a, reload)));
+  list.replaceChildren(...d.accounts.filter((a) => a.kind === "demo").map((a) => card(a, reload)));
+  const brokers = d.accounts.filter((a) => a.kind !== "demo" && !a.archived);
+  $("#brokerList").replaceChildren(...brokers.map((a) => brokerCard(a, reload)));
+  $("#bnState").textContent = brokers.some((a) => a.kind === "binance") ? `${brokers.filter((a) => a.kind === "binance").length} CONNECTED` : "NOT CONNECTED";
   if (note) {
     const first = list.querySelector(".acct-msg");
     if (first) say(first, note, "ok");
   }
 }
 
-/** The "New demo account" form is static markup; this wires it. */
+/** The "New demo account" and "Connect Binance" forms are static markup; this wires them. */
 export function wire() {
+  const bn = $("#bnForm");
+  bn.elements.environment.addEventListener("change", () => ($("#bnLive").hidden = bn.elements.environment.value !== "live"));
+  bn.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = bn.elements;
+    const body = { kind: "binance", environment: f.environment.value, label: f.label.value.trim(), api_key: f.api_key.value.trim(), api_secret: f.api_secret.value.trim() };
+    if (body.environment === "live") body.confirm_live = f.confirm_live.checked;
+    const msg = $("#bnMsg");
+    say(msg, "Checking the key with Binance…");
+    try {
+      await api("/api/accounts", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) });
+      bn.reset();
+      $("#bnLive").hidden = true;
+      say(msg, "Connected. Balances below come from Binance.", "ok");
+      await load();
+    } catch (err) {
+      say(msg, err.message, "err");
+    } finally {
+      f.api_secret.value = ""; // never keep the secret in the page longer than the request
+    }
+  });
   const form = $("#acctNew");
   form.addEventListener("submit", async (e) => {
     e.preventDefault();

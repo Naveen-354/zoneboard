@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 /// The latest schema version supported by this application.
-pub const CURRENT_VERSION: u32 = 5;
+pub const CURRENT_VERSION: u32 = 6;
 
 /// Database error type covering schema version mismatches, SQLite errors, and IO issues.
 #[derive(Debug)]
@@ -344,6 +344,21 @@ pub fn migrate(conn: &mut Connection) -> Result<(), DbError> {
             CREATE INDEX idx_positions_bot ON positions(bot_id);
             CREATE INDEX idx_trades_bot ON trades(bot_id);
             PRAGMA user_version = 5;",
+        )?;
+        tx.commit()?;
+        ver = 5;
+    }
+
+    if ver < 6 {
+        let tx = conn.transaction()?;
+        // Migration 6: broker connections (T007). Only non-secret metadata: the key hint (last 4 characters)
+        // and sync times. Credentials live in the OS vault, never here.
+        tx.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN key_hint TEXT;
+            ALTER TABLE accounts ADD COLUMN connected_utc TEXT;
+            ALTER TABLE accounts ADD COLUMN last_sync_utc TEXT;
+            ALTER TABLE accounts ADD COLUMN last_error TEXT;
+            PRAGMA user_version = 6;",
         )?;
         tx.commit()?;
     }

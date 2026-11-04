@@ -691,7 +691,12 @@ pub fn process(conn: &mut Connection, gate: &Gate, id: i64, a: &Frame, b: Option
     let prep = botengine::prepare(&strat, &Legs { a: &closed_a, b: closed_b.as_ref() })?;
     let legs = Legs { a: fa, b: fb };
     let engine = Engine { s: &strat, exec: Exec { fee_pct: crate::journal::fee_pct(&bot.market), slippage_pct: bot.slippage_pct, qty_step: [qty_step(&bot.market); 2] } };
-    let trade = bot.status == "running" && !gate.killed();
+    // no new entries on stale data (exits and stops still run)
+    let stale = crate::marketdata::check(&crate::backtest2::slice(fa, 0, closed_len), &bot.market, iv, now).stale;
+    if stale && bot.status == "running" {
+        log(conn, id, "warn", "market data is stale: no new entries until fresh candles arrive");
+    }
+    let trade = bot.status == "running" && !gate.killed() && !stale;
     let mut st = rs.engine.clone();
     let events;
     {

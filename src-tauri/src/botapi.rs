@@ -353,6 +353,12 @@ pub async fn backtest_run(State(s): State<Shared>, headers: HeaderMap, body: axu
         Ok(x) => x,
         Err(e) => return e,
     };
+    // repair order and duplicates first, and say so; gaps and staleness are reported, not hidden
+    let iv = bots::interval_secs(&r.interval).unwrap_or(3600);
+    let q = crate::marketdata::check(&fa, &r.market, iv, chrono::Utc::now().timestamp());
+    let (fa, removed) = crate::marketdata::repair(&fa);
+    let fa = Arc::new(fa);
+    let fb = fb.map(|b| Arc::new(crate::marketdata::repair(&b).0));
     let report = match tokio::task::spawn_blocking({
         let (st, fa, fb, cfg) = (st.clone(), fa.clone(), fb.clone(), r.cfg);
         move || backtest2::run(&st, &fa, fb.as_deref(), &cfg)
@@ -364,7 +370,7 @@ pub async fn backtest_run(State(s): State<Shared>, headers: HeaderMap, body: axu
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "backtest crashed"),
     };
     let candles: Vec<Value> = (0..fa.len()).map(|i| json!([fa.t[i], fa.o[i], fa.h[i], fa.l[i], fa.c[i]])).collect();
-    let data = json!({ "source": source_label(&r), "sample": r.sample, "market": r.market, "symbol": r.symbol, "symbol2": r.symbol2, "interval": r.interval, "bars": fa.len(), "from": fa.t.first(), "to": fa.t.last() });
+    let data = json!({ "source": source_label(&r), "sample": r.sample, "market": r.market, "symbol": r.symbol, "symbol2": r.symbol2, "interval": r.interval, "bars": fa.len(), "from": fa.t.first(), "to": fa.t.last(), "quality": q, "repaired_bars": removed });
     let request = json!({ "market": r.market, "symbol": r.symbol, "symbol2": r.symbol2, "interval": r.interval, "bars": r.bars, "capital": r.cfg.capital, "fee_pct": r.cfg.fee_pct, "slippage_pct": r.cfg.slippage_pct, "sample": r.sample, "spec": r.spec });
     let mut saved = None;
     if r.save {
@@ -565,5 +571,25 @@ pub async fn run_forever(s: Shared) {
     loop {
         every.tick().await;
         tick(&s).await;
+    }
+}
+
+/// `GET /api/market-data/health?market=&symbol=&interval=`: source, freshness and gaps of one series.
+pub async fn market_health(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let market = q.get("market").map_or("crypto", String::as_str).to_string();
+    let symbol = q.get("symbol").map_or("BTCUSDT", String::as_str).to_uppercase();
+    let interval = q.get("interval").map_or("1h", String::as_str).to_string();
+    let Some(iv) = bots::interval_secs(&interval) else { return err(StatusCode::BAD_REQUEST, "unknown interval") };
+    if !crate::data::valid_nse_symbol(&symbol) {
+        return err(StatusCode::BAD_REQUEST, "invalid symbol");
+    }
+    let sample = s.data.sample;
+    match s.data.bars(&market, &symbol, &interval, 500, sample, 30).await {
+        Ok(f) => {
+            let qual = crate::marketdata::check(&f, &market, iv, chrono::Utc::now().timestamp());
+            let src = if sample { "SAMPLE DATA (made up)" } else if market == "crypto" { "Binance public market data" } else { "Yahoo Finance (unofficial, ~15 min delayed)" };
+            Json(json!({ "market": market, "symbol": symbol, "interval": interval, "report": crate::marketdata::to_json(&qual, src) })).into_response()
+        }
+        Err(e) => err(StatusCode::BAD_GATEWAY, &format!("market data: {e}")),
     }
 }

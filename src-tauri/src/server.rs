@@ -84,12 +84,21 @@ pub struct AppState {
     api_token: String,
     /// Kill switch and live arming: runtime only, reset by a restart.
     pub(crate) gate: crate::risk::Gate,
+    /// Broker credentials: the OS keychain in the app, an in-memory store in tests.
+    pub(crate) vault: Arc<dyn crate::vault::SecretStore>,
+    pub(crate) endpoints: crate::connections::Endpoints,
+    pub(crate) conn_cache: crate::connections::Cache,
 }
 
 pub type Shared = Arc<AppState>;
 
 impl AppState {
     pub fn new(sample: bool, journal_path: &str) -> Result<Shared, String> {
+        Self::with_parts(sample, journal_path, Arc::new(crate::vault::KeychainStore::new()), crate::connections::Endpoints::default())
+    }
+
+    /// The state with a chosen vault and broker endpoints: tests use an in-memory vault and a fake exchange.
+    pub fn with_parts(sample: bool, journal_path: &str, vault: Arc<dyn crate::vault::SecretStore>, endpoints: crate::connections::Endpoints) -> Result<Shared, String> {
         let journal = Journal::open(journal_path).map_err(|e| format!("can't open journal {journal_path}: {e}"))?;
         journal.with_conn(|conn| {
             crate::audit::record(
@@ -111,6 +120,9 @@ impl AppState {
             scan: [Mutex::new(None), Mutex::new(None)],
             api_token,
             gate: crate::risk::Gate::default(),
+            vault,
+            endpoints,
+            conn_cache: crate::connections::Cache::default(),
         }))
     }
 
@@ -152,7 +164,9 @@ pub fn app(state: Shared) -> Router {
         .route("/api/audit", get(audit_get))
         .route("/api/settings", get(settings_get).put(settings_put))
         .route("/api/accounts", get(accounts_get).post(accounts_create))
-        .route("/api/accounts/{id}", patch(accounts_patch))
+        .route("/api/accounts/{id}", patch(accounts_patch).delete(accounts_disconnect))
+        .route("/api/accounts/{id}/balances", get(accounts_balances))
+        .route("/api/accounts/{id}/verify", post(accounts_verify))
         .route("/api/accounts/{id}/reset", post(accounts_reset))
         // Bot Studio (botapi.rs)
         .route("/api/bots", get(botapi::bots_list).post(botapi::bots_create))
@@ -165,6 +179,7 @@ pub fn app(state: Shared) -> Router {
         .route("/api/bots/{id}/backtests", get(botapi::bot_backtests))
         .route("/api/bots/{id}/live", get(botapi::bot_readiness))
         .route("/api/bots/{id}/deploy-live", post(botapi::bot_deploy_live))
+        .route("/api/market-data/health", get(botapi::market_health))
         .route("/api/strategies/library", get(botapi::library))
         .route("/api/backtest", post(botapi::backtest_run))
         .route("/api/backtest/optimize", post(botapi::backtest_optimize))
@@ -514,8 +529,34 @@ async fn accounts_get(State(s): State<Shared>) -> Response {
     account_response(s.journal.with_conn(|c| crate::accounts::list(c)), StatusCode::OK)
 }
 
+fn conn_response(r: Result<Value, crate::connections::ConnError>, ok: StatusCode) -> Response {
+    use crate::connections::ConnError;
+    match r {
+        Ok(v) => (ok, Json(v)).into_response(),
+        Err(ConnError::Bad(m)) => err(StatusCode::BAD_REQUEST, &m),
+        Err(ConnError::NotFound) => err(StatusCode::NOT_FOUND, "no such account"),
+        Err(ConnError::Conflict(m)) => err(StatusCode::CONFLICT, &m),
+        Err(ConnError::Upstream(m)) => err(StatusCode::BAD_GATEWAY, &m),
+    }
+}
+
+async fn accounts_balances(State(s): State<Shared>, Path(id): Path<String>) -> Response {
+    conn_response(crate::connections::balances(&s, &id).await, StatusCode::OK)
+}
+
+async fn accounts_verify(State(s): State<Shared>, Path(id): Path<String>) -> Response {
+    conn_response(crate::connections::verify(&s, &id).await, StatusCode::OK)
+}
+
+async fn accounts_disconnect(State(s): State<Shared>, Path(id): Path<String>) -> Response {
+    conn_response(crate::connections::disconnect(&s, &id).await, StatusCode::OK)
+}
+
 async fn accounts_create(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     let b = json_body(&headers, &body);
+    if b.get("kind").and_then(Value::as_str) == Some("binance") {
+        return conn_response(crate::connections::connect(&s, &b).await, StatusCode::CREATED);
+    }
     account_response(s.journal.with_conn(|c| crate::accounts::create(c, &b)), StatusCode::CREATED)
 }
 
