@@ -214,11 +214,12 @@ pub struct DataStore {
     pub sample: bool,
     one: Mutex<OneCache>,
     all: [Mutex<AllCache>; 2], // indexed by `sample as usize`
+    bot_cache: Mutex<OneCache>,
 }
 
 impl DataStore {
     pub fn new(sample: bool) -> Self {
-        Self { client: http_client(), sample, one: Mutex::new(HashMap::new()), all: [Mutex::new(None), Mutex::new(None)] }
+        Self { client: http_client(), sample, one: Mutex::new(HashMap::new()), all: [Mutex::new(None), Mutex::new(None)], bot_cache: Mutex::new(HashMap::new()) }
     }
 
     /// Bars for one NSE symbol at 1d / 1h / 15m, cached for a few minutes. `sample` = synthetic bars.
@@ -257,6 +258,47 @@ impl DataStore {
         let out = Arc::new(out);
         *slot = Some((Instant::now(), out.clone()));
         out
+    }
+
+    /// Bars for a bot or a backtest: Binance klines for crypto, Yahoo for NSE (delayed), synthetic for sample
+    /// data. The newest bar may still be forming. Cached for `ttl` seconds per (market, symbol, interval, bars).
+    pub async fn bars(&self, market: &str, sym: &str, interval: &str, bars: usize, sample: bool, ttl: u64) -> Result<Arc<Frame>, String> {
+        let key = (format!("{market}:{sym}:{bars}"), interval.to_string(), sample);
+        if let Some((t, v)) = self.bot_cache.lock().await.get(&key) {
+            if t.elapsed() < Duration::from_secs(ttl) {
+                if let Some(f) = v {
+                    return Ok(f.clone());
+                }
+            }
+        }
+        let frame = if sample {
+            let mut f = synthetic(sym, interval);
+            let skip = f.len().saturating_sub(bars);
+            if skip > 0 {
+                let mut g = Frame::default();
+                for i in skip..f.len() {
+                    g.push(f.t[i], f.o[i], f.h[i], f.l[i], f.c[i], f.v[i]);
+                }
+                f = g;
+            }
+            f
+        } else if market == "crypto" {
+            binance_frame(&self.client, sym, interval, bars).await?
+        } else {
+            // Yahoo serves a range, not a bar count: the widest range it allows for each interval
+            let range = match interval {
+                "1d" => "10y",
+                "1h" => "2y",
+                _ => "60d",
+            };
+            yahoo_frame(&self.client, sym, range, interval).await.ok_or_else(|| format!("no data for {sym} from Yahoo (check the symbol or your connection)"))?
+        };
+        if frame.is_empty() {
+            return Err(format!("no bars for {sym} {interval}"));
+        }
+        let frame = Arc::new(frame);
+        self.bot_cache.lock().await.insert(key, (Instant::now(), Some(frame.clone())));
+        Ok(frame)
     }
 
     pub fn client(&self) -> &Client {

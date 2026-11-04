@@ -249,7 +249,7 @@ fn fixture_v2_migrates_to_latest_with_data_intact() {
     db::migrate(&mut conn).unwrap();
 
     assert_eq!(db::user_version(&conn).unwrap(), CURRENT_VERSION);
-    assert_eq!(db::user_version(&conn).unwrap(), 4);
+    assert_eq!(db::user_version(&conn).unwrap(), 5);
 
     // Verify data is completely intact
     let trade_count_v3: i64 = conn.query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0)).unwrap();
@@ -308,7 +308,7 @@ fn migration_4_on_a_populated_v3_database_links_demo_rows_and_seeds_the_wallet()
     assert_eq!(db::user_version(&c).unwrap(), 3);
     db::migrate(&mut c).unwrap(); // would fail here if account_id were NOT NULL DEFAULT ... REFERENCES
 
-    assert_eq!(db::user_version(&c).unwrap(), 4);
+    assert_eq!(db::user_version(&c).unwrap(), 5);
     // demo rows are linked to demo-1, the live ones belong to no account
     assert_eq!(q::<i64>(&c, "SELECT count(*) FROM trades WHERE mode = 'demo' AND account_id = 'demo-1'"), 4);
     assert_eq!(q::<i64>(&c, "SELECT count(*) FROM trades WHERE mode = 'demo'"), 4);
@@ -348,7 +348,7 @@ fn migration_4_on_a_populated_v3_database_links_demo_rows_and_seeds_the_wallet()
 #[test]
 fn migration_4_on_a_fresh_database_creates_demo_1_with_default_credits() {
     let c = db::open(":memory:").unwrap();
-    assert_eq!(db::user_version(&c).unwrap(), 4);
+    assert_eq!(db::user_version(&c).unwrap(), 5);
     let (id, kind, label, env, status, archived): (String, String, String, String, String, i64) =
         c.query_row("SELECT id, kind, label, environment, status, archived FROM accounts", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap();
     assert_eq!((id.as_str(), kind.as_str(), label.as_str(), env.as_str(), status.as_str(), archived), ("demo-1", "demo", "Demo", "paper", "active", 0));
@@ -394,4 +394,29 @@ fn foreign_keys_are_enforced_and_schema_checks_hold() {
     assert!(c.execute("INSERT INTO demo_wallets (account_id, currency, credits, balance) VALUES ('nope','USDT','1','1')", []).is_err());
     assert!(c.execute("INSERT INTO accounts (id, kind, label, environment, created_utc) VALUES ('x','demo','x','live','now')", []).is_err(), "a demo account is always paper");
     assert!(c.execute("INSERT INTO accounts (id, kind, label, environment, created_utc) VALUES ('x','kraken','x','paper','now')", []).is_err());
+}
+
+#[test]
+fn migration_5_on_a_populated_database_adds_bots_and_leaves_existing_rows_manual() {
+    let path = create_from_fixture("legacy_v3_demo.sql");
+    let mut c = Connection::open(&path).unwrap();
+    let (trades, positions): (i64, i64) = (q(&c, "SELECT count(*) FROM trades"), q(&c, "SELECT count(*) FROM positions"));
+    db::migrate(&mut c).unwrap();
+    assert_eq!(db::user_version(&c).unwrap(), 5);
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM trades"), trades);
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM positions"), positions);
+    // every existing row is manual: no bot owns it
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM trades WHERE bot_id IS NOT NULL"), 0);
+    assert_eq!(q::<i64>(&c, "SELECT count(*) FROM positions WHERE bot_id IS NOT NULL"), 0);
+    for t in ["bots", "bot_orders", "bot_logs", "backtests", "account_limits"] {
+        assert_eq!(q::<i64>(&c, &format!("SELECT count(*) FROM {t}")), 0, "{t}");
+    }
+    // a bot row can be written against the seeded demo account, and a bad mode is refused by the schema
+    c.execute("INSERT INTO bots (name, market, exchange, mode, account_id, symbol, interval, spec, allocation, created_utc, updated_utc) VALUES ('b','crypto','binance','demo','demo-1','BTCUSDT','1h','{}','100','x','x')", []).unwrap();
+    assert!(c.execute("INSERT INTO bots (name, market, exchange, mode, account_id, symbol, interval, spec, allocation, created_utc, updated_utc) VALUES ('b','crypto','binance','paper','demo-1','BTCUSDT','1h','{}','100','x','x')", []).is_err());
+    // re-running is a no-op
+    db::migrate(&mut c).unwrap();
+    assert_eq!(db::user_version(&c).unwrap(), 5);
+    drop(c);
+    let _ = std::fs::remove_file(&path);
 }

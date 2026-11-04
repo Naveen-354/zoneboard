@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 /// The latest schema version supported by this application.
-pub const CURRENT_VERSION: u32 = 4;
+pub const CURRENT_VERSION: u32 = 5;
 
 /// Database error type covering schema version mismatches, SQLite errors, and IO issues.
 #[derive(Debug)]
@@ -252,6 +252,99 @@ pub fn migrate(conn: &mut Connection) -> Result<(), DbError> {
         )?;
         crate::accounts::seed_from_legacy(&tx)?;
         tx.execute_batch("PRAGMA user_version = 4;")?;
+        tx.commit()?;
+        ver = 4;
+    }
+
+    if ver < 5 {
+        let tx = conn.transaction()?;
+        // Migration 5: bots, their orders and logs, saved backtests, and per-account risk limits (Bot Studio).
+        // Bot positions and trades live in the existing `positions` / `trades` tables, tagged with `bot_id`, so
+        // they reserve the same virtual funds as manual orders and show in the Journal. New columns are
+        // nullable: existing rows are manual and stay that way. Money columns are decimal TEXT.
+        tx.execute_batch(
+            "CREATE TABLE bots (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 60),
+                description  TEXT NOT NULL DEFAULT '' CHECK (length(description) <= 500),
+                avatar       TEXT NOT NULL DEFAULT '',
+                market       TEXT NOT NULL CHECK (market IN ('crypto','india')),
+                exchange     TEXT NOT NULL CHECK (exchange IN ('binance','fyers')),
+                mode         TEXT NOT NULL CHECK (mode IN ('demo','live')),
+                account_id   TEXT NOT NULL REFERENCES accounts(id),
+                symbol       TEXT NOT NULL,
+                symbol2      TEXT,
+                interval     TEXT NOT NULL,
+                spec         TEXT NOT NULL,
+                template     TEXT,
+                source       TEXT,
+                allocation   TEXT NOT NULL,
+                max_daily_loss TEXT,
+                max_open_positions INTEGER NOT NULL DEFAULT 10 CHECK (max_open_positions BETWEEN 1 AND 100),
+                slippage_pct REAL NOT NULL DEFAULT 0.05,
+                status       TEXT NOT NULL DEFAULT 'stopped' CHECK (status IN ('stopped','running','paused')),
+                state        TEXT NOT NULL DEFAULT '{}',
+                last_price   REAL,
+                last_price_utc TEXT,
+                last_error   TEXT,
+                created_utc  TEXT NOT NULL,
+                updated_utc  TEXT NOT NULL,
+                started_utc  TEXT
+            );
+            CREATE TABLE bot_orders (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id      INTEGER NOT NULL,
+                ts_utc      TEXT NOT NULL,
+                bar_time    INTEGER,
+                symbol      TEXT NOT NULL,
+                side        TEXT NOT NULL,
+                action      TEXT NOT NULL CHECK (action IN ('open','close')),
+                qty         REAL NOT NULL,
+                price       REAL NOT NULL,
+                status      TEXT NOT NULL CHECK (status IN ('filled','rejected')),
+                reason      TEXT NOT NULL DEFAULT '',
+                position_id INTEGER,
+                trade_id    INTEGER
+            );
+            CREATE INDEX idx_bot_orders_bot ON bot_orders(bot_id, id);
+            CREATE TABLE bot_logs (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id  INTEGER NOT NULL,
+                ts_utc  TEXT NOT NULL,
+                level   TEXT NOT NULL,
+                message TEXT NOT NULL
+            );
+            CREATE INDEX idx_bot_logs_bot ON bot_logs(bot_id, id);
+            CREATE TABLE backtests (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id      INTEGER,
+                created_utc TEXT NOT NULL,
+                request     TEXT NOT NULL,
+                metrics     TEXT NOT NULL,
+                report      TEXT NOT NULL
+            );
+            CREATE INDEX idx_backtests_bot ON backtests(bot_id, id);
+            CREATE TABLE account_limits (
+                account_id         TEXT NOT NULL REFERENCES accounts(id),
+                currency           TEXT NOT NULL CHECK (currency IN ('USDT','INR')),
+                max_order_notional TEXT,
+                max_daily_loss     TEXT,
+                max_exposure       TEXT,
+                PRIMARY KEY (account_id, currency)
+            );
+            ALTER TABLE positions ADD COLUMN bot_id INTEGER;
+            ALTER TABLE positions ADD COLUMN leg INTEGER;
+            ALTER TABLE positions ADD COLUMN stop REAL;
+            ALTER TABLE positions ADD COLUMN target REAL;
+            ALTER TABLE positions ADD COLUMN trail TEXT;
+            ALTER TABLE positions ADD COLUMN trail_ref REAL;
+            ALTER TABLE positions ADD COLUMN tag TEXT;
+            ALTER TABLE positions ADD COLUMN bar_time INTEGER;
+            ALTER TABLE trades ADD COLUMN bot_id INTEGER;
+            CREATE INDEX idx_positions_bot ON positions(bot_id);
+            CREATE INDEX idx_trades_bot ON trades(bot_id);
+            PRAGMA user_version = 5;",
+        )?;
         tx.commit()?;
     }
 

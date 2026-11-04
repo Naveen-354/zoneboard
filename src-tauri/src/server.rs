@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
+use crate::botapi;
 use crate::data::{self, DataStore};
 use crate::journal::{self, Journal};
 use crate::zones::{self, Label, Summary};
@@ -77,10 +78,12 @@ pub fn render_index_html(template: &str, token: &str) -> String {
 }
 
 pub struct AppState {
-    data: DataStore,
-    journal: Journal,
+    pub(crate) data: DataStore,
+    pub(crate) journal: Journal,
     scan: [Mutex<Option<(Instant, Value)>>; 2], // indexed by `sample as usize`: sample and real scans never share a cache
     api_token: String,
+    /// Kill switch and live arming: runtime only, reset by a restart.
+    pub(crate) gate: crate::risk::Gate,
 }
 
 pub type Shared = Arc<AppState>;
@@ -100,12 +103,14 @@ impl AppState {
                 }),
             )
         }).map_err(|e| format!("can't record app_start audit entry: {e}"))?;
+        journal.with_conn(|conn| crate::bots::pause_all_on_start(conn));
         let api_token = generate_api_token();
         Ok(Arc::new(Self {
             data: DataStore::new(sample),
             journal,
             scan: [Mutex::new(None), Mutex::new(None)],
             api_token,
+            gate: crate::risk::Gate::default(),
         }))
     }
 
@@ -129,7 +134,7 @@ pub fn sample_from_env() -> bool {
     std::env::var("SAMPLE_DATA").as_deref() == Ok("1")
 }
 
-fn err(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn err(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
@@ -149,6 +154,26 @@ pub fn app(state: Shared) -> Router {
         .route("/api/accounts", get(accounts_get).post(accounts_create))
         .route("/api/accounts/{id}", patch(accounts_patch))
         .route("/api/accounts/{id}/reset", post(accounts_reset))
+        // Bot Studio (botapi.rs)
+        .route("/api/bots", get(botapi::bots_list).post(botapi::bots_create))
+        .route("/api/bots/{id}", get(botapi::bot_get).put(botapi::bot_update).delete(botapi::bot_delete))
+        .route("/api/bots/{id}/duplicate", post(botapi::bot_duplicate))
+        .route("/api/bots/{id}/start", post(botapi::bot_start))
+        .route("/api/bots/{id}/pause", post(botapi::bot_pause))
+        .route("/api/bots/{id}/stop", post(botapi::bot_stop))
+        .route("/api/bots/{id}/logs", get(botapi::bot_logs))
+        .route("/api/bots/{id}/backtests", get(botapi::bot_backtests))
+        .route("/api/bots/{id}/live", get(botapi::bot_readiness))
+        .route("/api/bots/{id}/deploy-live", post(botapi::bot_deploy_live))
+        .route("/api/strategies/library", get(botapi::library))
+        .route("/api/backtest", post(botapi::backtest_run))
+        .route("/api/backtest/optimize", post(botapi::backtest_optimize))
+        .route("/api/backtests/{id}", get(botapi::backtest_get))
+        .route("/api/risk", get(botapi::risk_status))
+        .route("/api/risk/kill", post(botapi::risk_kill))
+        .route("/api/risk/limits/{account}", get(botapi::risk_limits_get).put(botapi::risk_limits_put))
+        .route("/api/live/arm", post(botapi::live_arm))
+        .route("/api/live/disarm", post(botapi::live_disarm))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -360,7 +385,7 @@ fn market_mode(q: &HashMap<String, String>) -> Result<(&str, &str), Response> {
 
 /// A JSON request body, or Null. JSON only, like Flask's get_json(): a cross-site form post can't send
 /// this content type without a CORS preflight.
-fn json_body(headers: &HeaderMap, body: &[u8]) -> Value {
+pub(crate) fn json_body(headers: &HeaderMap, body: &[u8]) -> Value {
     let is_json = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("application/json"));
     if is_json {
         serde_json::from_slice(body).unwrap_or(Value::Null)
@@ -397,7 +422,8 @@ async fn positions_get(State(s): State<Shared>, Query(q): Query<HashMap<String, 
 }
 
 async fn positions_open(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
-    match s.journal.open_position(&json_body(&headers, &body)) {
+    // the same pre-trade checks bots get: kill switch and the account's risk limits
+    match s.journal.open_position_checked(&json_body(&headers, &body), |c, o| crate::risk::check(c, o, &s.gate)) {
         Ok(p) => (StatusCode::CREATED, Json(json!({ "ok": true, "position": p }))).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, &e),
     }
@@ -526,6 +552,7 @@ pub fn port_of(listeners: &[TcpListener]) -> u16 {
 }
 
 pub async fn serve(listeners: Vec<TcpListener>, state: Shared) -> std::io::Result<()> {
+    tokio::spawn(botapi::run_forever(state.clone()));
     let router = app(state);
     let mut tasks = tokio::task::JoinSet::new();
     for l in listeners {
