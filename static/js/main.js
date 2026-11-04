@@ -223,7 +223,7 @@ $("#mode").addEventListener("click", (e) => {
 $("#goChart").addEventListener("click", () => showView("board"));
 
 // ---------------------------------------------------------------- views
-const VIEWS = ["board", "orders", "accounts", "journal", "settings"];
+const VIEWS = ["board", "orders", "bots", "accounts", "journal", "settings"];
 
 // The Accounts and Settings pages are fetched on first visit, so they add nothing to the page-load path.
 const pages = {};
@@ -239,6 +239,9 @@ function accountsPage() {
     m.wire();
     return m;
   }));
+}
+function botsPage() {
+  return (pages.bots ??= import("./bots/studio.js").then((m) => (m.wire(), m)));
 }
 function settingsPage() {
   return (pages.settings ??= import("./settings.js").then((m) => (m.wire(), m)));
@@ -259,6 +262,7 @@ function showView(v) {
   else if (v === "journal") journal.load();
   else if (v === "accounts") accountsPage().then((m) => m.load(), onPageError);
   else if (v === "settings") settingsPage().then((m) => m.load(), onPageError);
+  else if (v === "bots") botsPage().then((m) => m.load(), onPageError);
 }
 const onPageError = (e) => view.banner(`Can't open this page: ${e.message}`, { err: true });
 $("#tabs").addEventListener("click", (e) => {

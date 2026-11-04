@@ -39,6 +39,7 @@
   <nav class="seg" id="tabs" aria-label="Pages">
     <button type="button" data-v="board" class="on" aria-current="page">Board</button>
     <button type="button" data-v="orders">Orders</button>
+    <button type="button" data-v="bots">Bot Studio</button>
     <button type="button" data-v="accounts">Accounts</button>
     <button type="button" data-v="journal">Journal</button>
     <button type="button" data-v="settings">Settings</button>
@@ -152,6 +153,12 @@
     <h1>Orders</h1>
     <p>Order management arrives with the execution core. Until then, place practice orders from the ticket on the Board; a closed position is logged in the Journal.</p>
   </section>
+</main>
+
+<main class="page studio" id="botsView" hidden>
+  <div class="jhead"><div><b>Bot Studio</b><span class="jsub">Build, backtest and run trading bots on the demo account</span></div><span class="jsub" id="stNote" role="status"></span></div>
+  <nav class="seg st-tabs" id="stTabs" role="tablist" aria-label="Bot Studio sections"></nav>
+  <div class="st-body" id="stBody"></div>
 </main>
 
 <main class="page" id="accountsView" hidden>
