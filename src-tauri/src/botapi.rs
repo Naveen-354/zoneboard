@@ -886,3 +886,129 @@ pub async fn ai_review(State(s): State<Shared>, headers: HeaderMap, body: axum::
 pub async fn ai_proposals(State(s): State<Shared>) -> Response {
     ai_out(s.journal.with_conn(|c| crate::ai::proposals(c)))
 }
+
+// ------------------------------------------------------------------ scanner
+
+pub async fn scanner_catalog() -> Json<Value> {
+    Json(crate::scanner::catalog())
+}
+
+/// `POST /api/scanner/run {template, market, interval, params}`.
+pub async fn scanner_run(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    use futures_util::stream::{self, StreamExt};
+    let b = json_body(&headers, &body);
+    let template = b.get("template").and_then(Value::as_str).unwrap_or("movers").to_string();
+    let market = b.get("market").and_then(Value::as_str).unwrap_or("crypto").to_string();
+    let interval = b.get("interval").and_then(Value::as_str).unwrap_or(if market == "crypto" { "1h" } else { "1d" }).to_string();
+    let params = b.get("params").cloned().unwrap_or(json!({}));
+    let Some(t) = crate::scanner::TEMPLATES.iter().find(|t| t.id == template) else { return err(StatusCode::BAD_REQUEST, "unknown scan template") };
+    if !t.markets.contains(&market.as_str()) {
+        return err(StatusCode::BAD_REQUEST, &format!("the {} scan is not available for {market}", t.name));
+    }
+    let allowed: &[&str] = if market == "crypto" { &bots::CRYPTO_INTERVALS } else { &bots::INDIA_INTERVALS };
+    if !allowed.contains(&interval.as_str()) {
+        return err(StatusCode::BAD_REQUEST, &format!("timeframe must be one of {}", allowed.join(", ")));
+    }
+    if template == "gap" && interval != "1d" {
+        return err(StatusCode::BAD_REQUEST, "the gap scan needs daily bars");
+    }
+    let iv = bots::interval_secs(&interval).unwrap_or(3600);
+    let universe: Vec<String> = if market == "crypto" { crate::data::load_crypto_symbols() } else { crate::data::load_symbols() };
+    let now = chrono::Utc::now().timestamp();
+    let sample = s.data.sample;
+    let fetched: Vec<(String, Result<Arc<Frame>, String>)> = stream::iter(universe.clone())
+        .map(|sym| {
+            let (s, m, i) = (s.clone(), market.clone(), interval.clone());
+            async move {
+                let r = s.data.bars(&m, &sym, &i, 300, sample, 120).await;
+                (sym, r)
+            }
+        })
+        .buffer_unordered(6)
+        .collect()
+        .await;
+    let mut frames = vec![];
+    let mut stale = vec![];
+    let mut failed = vec![];
+    // keep the universe order (the correlation scan compares with the first symbol)
+    for sym in &universe {
+        match fetched.iter().find(|(x, _)| x == sym).map(|x| &x.1) {
+            Some(Ok(f)) => {
+                let closed = f.t.iter().take_while(|&&t| t + iv <= now).count();
+                let fr = backtest2::slice(f, 0, closed);
+                if crate::marketdata::check(&fr, &market, iv, now).stale {
+                    stale.push(sym.clone());
+                }
+                frames.push((sym.clone(), fr));
+            }
+            Some(Err(e)) => failed.push(json!({ "symbol": sym, "error": e })),
+            None => {}
+        }
+    }
+    let rows = match crate::scanner::scan(&template, &params, &frames) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &e),
+    };
+    let rows: Vec<Value> = rows.into_iter().map(|mut r| {
+        let sym = r["symbol"].as_str().unwrap_or("").to_string();
+        r["fresh"] = json!(!stale.contains(&sym));
+        r
+    }).collect();
+    let source = if sample { "SAMPLE DATA (made up)" } else if market == "crypto" { "Binance public market data" } else { "Yahoo Finance (unofficial, ~15 min delayed)" };
+    let out = json!({
+        "template": template, "name": t.name, "formula": t.formula, "params": params, "market": market, "interval": interval,
+        "source": source, "scanned_utc": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "universe": universe.len(),
+        "scanned": frames.len(), "stale_symbols": stale, "failed": failed, "results": rows,
+        "note": "Closed candles only. Results are information: they can start a backtest, never an order.",
+    });
+    let _ = s.journal.with_conn(|c| {
+        c.execute("INSERT INTO scan_runs (created_utc, template, request, results) VALUES (?1,?2,?3,?4)", params![out["scanned_utc"].as_str(), template, json!({ "market": market, "interval": interval, "params": out["params"] }).to_string(), out["results"].to_string()])
+    });
+    Json(out).into_response()
+}
+
+pub async fn scanner_history(State(s): State<Shared>) -> Response {
+    let r = s.journal.with_conn(|c| -> rusqlite::Result<Vec<Value>> {
+        let mut st = c.prepare("SELECT id, created_utc, template, request, results FROM scan_runs ORDER BY id DESC LIMIT 30")?;
+        let m = st.query_map([], |r| {
+            let res: Value = serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(Value::Null);
+            Ok(json!({ "id": r.get::<_, i64>(0)?, "created_utc": r.get::<_, String>(1)?, "template": r.get::<_, String>(2)?, "request": serde_json::from_str::<Value>(&r.get::<_, String>(3)?).unwrap_or(Value::Null), "hits": res.as_array().map_or(0, |a| a.len()), "top": res.as_array().map(|a| a.iter().take(5).map(|x| x["symbol"].clone()).collect::<Vec<_>>()) }))
+        })?;
+        Ok(m.filter_map(Result::ok).collect())
+    });
+    match r {
+        Ok(v) => Json(json!({ "runs": v })).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ------------------------------------------------------------------ portfolio
+
+/// `GET /api/portfolio`: every account; broker balances from the broker with a reconciliation against the
+/// bots' recorded positions; attribution, period reports, exposure, correlation and an allocation proposal.
+pub async fn portfolio(State(s): State<Shared>) -> Response {
+    let brokers: Vec<String> = s.journal.with_conn(|c| c.prepare("SELECT id FROM accounts WHERE kind = 'binance' AND archived = 0").and_then(|mut st| st.query_map([], |r| r.get(0)).map(|m| m.filter_map(Result::ok).collect())).unwrap_or_default());
+    let mut broker = serde_json::Map::new();
+    for a in brokers {
+        let v = match crate::connections::balances(&s, &a).await {
+            Ok(b) => {
+                let rec = s.journal.with_conn(|c| crate::portfolio::reconcile(c, &a, &b));
+                json!({ "balances": b, "reconciliation": rec })
+            }
+            Err(crate::connections::ConnError::Upstream(m)) | Err(crate::connections::ConnError::Bad(m)) | Err(crate::connections::ConnError::Conflict(m)) => json!({ "error": m }),
+            Err(crate::connections::ConnError::NotFound) => json!({ "error": "not found" }),
+        };
+        broker.insert(a, v);
+    }
+    match s.journal.with_conn(|c| crate::portfolio::overview(c, Value::Object(broker))) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+}
+
+pub async fn portfolio_csv(State(s): State<Shared>) -> Response {
+    match s.journal.with_conn(|c| crate::portfolio::trades_csv(c)) {
+        Ok(csv) => ([(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"), (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"zoneboard-trades.csv\"")], csv).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+}

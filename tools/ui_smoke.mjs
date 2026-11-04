@@ -262,7 +262,7 @@ const scenarios = [
     try {
       await p.load(url);
       await waitBooted(p);
-      for (const view of ["board", "orders", "bots", "accounts", "journal", "settings"]) {
+      for (const view of ["board", "orders", "scanner", "bots", "portfolio", "accounts", "journal", "settings"]) {
         await p.eval(`document.querySelector('#tabs [data-v=${view}]').click()`);
         await sleep(300);
         const m = await p.eval(`({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth, bw: document.body.scrollWidth })`);

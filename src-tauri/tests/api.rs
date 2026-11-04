@@ -337,6 +337,11 @@ const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
     ("POST", "/api/approvals/{id}/revoke", "/api/approvals/999999/revoke", None),
     ("GET", "/api/system/health", "/api/system/health", None),
     ("GET", "/api/ai/status", "/api/ai/status", None),
+    ("GET", "/api/scanner", "/api/scanner", None),
+    ("GET", "/api/portfolio", "/api/portfolio", None),
+    ("GET", "/api/portfolio/trades.csv", "/api/portfolio/trades.csv", None),
+    ("POST", "/api/scanner/run", "/api/scanner/run", Some(r#"{"template":"nope"}"#)),
+    ("GET", "/api/scanner/history", "/api/scanner/history", None),
     ("PUT", "/api/ai/key", "/api/ai/key", Some(r#"{"api_key":"x"}"#)),
     ("DELETE", "/api/ai/key", "/api/ai/key", None),
     ("POST", "/api/ai/settings", "/api/ai/settings", Some(r#"{}"#)),
@@ -1141,4 +1146,20 @@ async fn bot_studio_flow() {
     for a in ["bot_created", "bot_updated", "bot_deleted", "risk_limits_updated", "kill_switch_on", "kill_switch_off"] {
         assert!(actions.contains(&a), "missing audit {a}: {actions:?}");
     }
+}
+
+#[tokio::test]
+async fn scanner_runs_on_sample_data_with_source_and_formula() {
+    let r = router();
+    let (s, cat) = get_json(&r, "/api/scanner").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(cat["unsupported"].as_array().unwrap().len() >= 3);
+    let (s, out) = send(&r, "POST", "/api/scanner/run", Some(json!({ "template": "movers", "market": "india", "interval": "1d", "params": { "lookback": 5, "threshold_pct": 0.1 } }))).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert!(out["source"].as_str().unwrap().contains("SAMPLE"));
+    assert!(out["formula"].as_str().unwrap().contains("threshold_pct"));
+    assert!(out["scanned"].as_u64().unwrap() > 50);
+    assert!(!out["results"].as_array().unwrap().is_empty());
+    assert_eq!(send(&r, "POST", "/api/scanner/run", Some(json!({ "template": "gap", "market": "crypto" }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(get_json(&r, "/api/scanner/history").await.1["runs"].as_array().unwrap().len(), 1);
 }

@@ -113,6 +113,19 @@ export async function load() {
     }
   }
   await refresh(false);
+  // a research experiment handed over from the Scanner: a backtest of a template on that symbol
+  let research = null;
+  try {
+    research = JSON.parse(sessionStorage.getItem("zb.research") || "null");
+    sessionStorage.removeItem("zb.research");
+  } catch {
+    /* storage unavailable */
+  }
+  if (research) {
+    const t = ctx.library.templates.find((x) => x.id === "ema_cross");
+    ctx.goBacktest({ ...builder.blank(), name: `Research: ${research.symbol}`, market: research.market, symbol: research.symbol, interval: research.interval, spec: JSON.parse(JSON.stringify(t.spec)), template: t.id });
+    return;
+  }
   go(tab);
   clearInterval(timer);
   // keep the dashboard fresh while it is on screen; the runner itself lives in the server
