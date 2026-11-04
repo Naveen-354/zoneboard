@@ -265,6 +265,7 @@ function botsPage() {
 function settingsPage() {
   return (pages.settings ??= import("./settings.js").then((m) => (m.wire(), m)));
 }
+const devHub = () => (pages.dev ??= import("./devhub.js"));
 
 function showView(v) {
   if (!VIEWS.includes(v)) v = "board";
@@ -280,7 +281,10 @@ function showView(v) {
   if (v === "board") trading.render();
   else if (v === "journal") journal.load();
   else if (v === "accounts") accountsPage().then((m) => m.load(), onPageError);
-  else if (v === "settings") settingsPage().then((m) => m.load(), onPageError);
+  else if (v === "settings") {
+    settingsPage().then((m) => m.load(), onPageError);
+    devHub().then((m) => m.load(), onPageError);
+  }
   else if (v === "bots") botsPage().then((m) => m.load(), onPageError);
   else if (v === "scanner") scannerPage().then((m) => m.load(), onPageError);
   else if (v === "portfolio") portfolioPage().then((m) => m.load(), onPageError);

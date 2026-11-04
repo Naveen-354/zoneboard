@@ -89,6 +89,7 @@ pub struct AppState {
     pub(crate) endpoints: crate::connections::Endpoints,
     pub(crate) conn_cache: crate::connections::Cache,
     pub(crate) ai: crate::ai::AiState,
+    pub(crate) dev_limiter: crate::devtokens::Limiter,
 }
 
 pub type Shared = Arc<AppState>;
@@ -125,6 +126,7 @@ impl AppState {
             endpoints,
             conn_cache: crate::connections::Cache::default(),
             ai: crate::ai::AiState::default(),
+            dev_limiter: crate::devtokens::Limiter::default(),
         }))
     }
 
@@ -200,6 +202,10 @@ pub fn app(state: Shared) -> Router {
         .route("/api/approvals/{id}/revoke", post(botapi::approval_revoke))
         .route("/api/system/health", get(botapi::system_health))
         .route("/api/scanner", get(botapi::scanner_catalog))
+        .route("/api/dev/tokens", get(botapi::dev_tokens).post(botapi::dev_token_create))
+        .route("/api/dev/tokens/{id}", delete(botapi::dev_token_revoke))
+        .route("/api/openapi.json", get(botapi::openapi))
+        .route("/api/strategies/pack", get(botapi::strategies_pack).post(botapi::strategies_import_pack))
         .route("/api/portfolio", get(botapi::portfolio))
         .route("/api/portfolio/trades.csv", get(botapi::portfolio_csv))
         .route("/api/scanner/run", post(botapi::scanner_run))
@@ -266,7 +272,16 @@ async fn guard(State(state): State<Shared>, req: Request, next: Next) -> Respons
             None => false,
         };
         if !valid {
-            return err(StatusCode::UNAUTHORIZED, "missing or invalid API token");
+            // a scoped developer token (Authorization: Bearer zbk_...) may stand in, for its scopes only
+            let bearer = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).filter(|t| t.starts_with("zbk_")).map(str::to_string);
+            let Some(tok) = bearer else {
+                return err(StatusCode::UNAUTHORIZED, "missing or invalid API token");
+            };
+            let m = req.method().as_str().to_string();
+            let p = path.to_string();
+            if let Err((code, msg)) = state.journal.with_conn(|c| crate::devtokens::authorize(c, &state.dev_limiter, &tok, &m, &p)) {
+                return err(StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN), msg);
+            }
         }
     }
 

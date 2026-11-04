@@ -129,6 +129,49 @@ pub fn import(conn: &Connection, doc: &Value) -> Result<Value, String> {
     Ok(json!({ "version_id": vid, "version": v, "hash": h }))
 }
 
+pub const PACK_FORMAT: &str = "zoneboard-pack";
+
+/// Every strategy's latest version as one pack.
+pub fn export_pack(conn: &Connection) -> Result<Value, String> {
+    let mut st = conn.prepare("SELECT max(id) FROM strategy_versions GROUP BY strategy_id").map_err(|e| e.to_string())?;
+    let ids: Vec<i64> = st.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?.filter_map(Result::ok).collect();
+    let docs: Result<Vec<Value>, String> = ids.into_iter().map(|id| export(conn, id)).collect();
+    Ok(json!({ "format": PACK_FORMAT, "schema": SCHEMA, "requires_engine": crate::backtest2::ENGINE_VERSION, "name": "ZoneBoard strategies", "strategies": docs? }))
+}
+
+/// Import a pack: every strategy is checked first; if any fails, nothing is imported.
+pub fn import_pack(conn: &Connection, pack: &Value) -> Result<Value, String> {
+    if pack.get("format").and_then(Value::as_str) != Some(PACK_FORMAT) {
+        return Err(format!("not a strategy pack (format must be {PACK_FORMAT})"));
+    }
+    if pack.get("schema").and_then(Value::as_i64) != Some(SCHEMA) {
+        return Err(format!("pack schema not supported (this build reads schema {SCHEMA})"));
+    }
+    if let Some(e) = pack.get("requires_engine").and_then(Value::as_str) {
+        if e != crate::backtest2::ENGINE_VERSION {
+            return Err(format!("this pack was made for engine {e}; this build runs {}: results could differ, so it is refused", crate::backtest2::ENGINE_VERSION));
+        }
+    }
+    let list = pack.get("strategies").and_then(Value::as_array).ok_or("a pack needs a strategies list")?;
+    if list.is_empty() || list.len() > 200 {
+        return Err("a pack holds 1 to 200 strategies".into());
+    }
+    for (i, d) in list.iter().enumerate() {
+        let spec = d.get("spec").ok_or(format!("strategy {}: no spec", i + 1))?;
+        crate::strategy::parse(spec).map_err(|e| format!("strategy {}: {e}", i + 1))?;
+        if d.get("hash").and_then(Value::as_str).is_some_and(|h| h != hash(spec)) {
+            return Err(format!("strategy {}: hash mismatch (changed or damaged)", i + 1));
+        }
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mut out = vec![];
+    for d in list {
+        out.push(import(&tx, d)?);
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(json!({ "imported": out }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +214,21 @@ mod tests {
         let mut future = doc;
         future["schema"] = json!(99);
         assert!(import(&c2, &future).unwrap_err().contains("schema"));
+    }
+
+    #[test]
+    fn packs_are_all_or_nothing_and_engine_checked() {
+        let c = crate::db::open(":memory:").unwrap();
+        publish(&c, "RSI", &spec(), "", "user").unwrap();
+        let pack = export_pack(&c).unwrap();
+        let c2 = crate::db::open(":memory:").unwrap();
+        let mut bad = pack.clone();
+        bad["strategies"].as_array_mut().unwrap().push(json!({ "format": EXPORT_FORMAT, "schema": 1, "name": "Bad", "spec": { "kind": "nope" } }));
+        assert!(import_pack(&c2, &bad).is_err());
+        assert_eq!(list(&c2).unwrap()["strategies"].as_array().unwrap().len(), 0, "nothing imported when one fails");
+        let mut old = pack.clone();
+        old["requires_engine"] = json!("botengine-0");
+        assert!(import_pack(&c2, &old).unwrap_err().contains("engine"));
+        assert_eq!(import_pack(&c2, &pack).unwrap()["imported"].as_array().unwrap().len(), 1);
     }
 }

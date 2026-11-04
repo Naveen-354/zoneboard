@@ -1012,3 +1012,127 @@ pub async fn portfolio_csv(State(s): State<Shared>) -> Response {
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
 }
+
+// ------------------------------------------------------------------ developer hub
+
+pub async fn dev_tokens(State(s): State<Shared>) -> Response {
+    sv(s.journal.with_conn(|c| crate::devtokens::list(c)), StatusCode::OK)
+}
+
+pub async fn dev_token_create(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    let name = b.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let scopes: Vec<String> = b.get("scopes").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    sv(s.journal.with_conn(|c| crate::devtokens::create(c, &name, &scopes)), StatusCode::CREATED)
+}
+
+pub async fn dev_token_revoke(State(s): State<Shared>, Path(id): Path<i64>) -> Response {
+    match s.journal.with_conn(|c| crate::devtokens::revoke(c, id)) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, &e),
+    }
+}
+
+pub async fn strategies_pack(State(s): State<Shared>) -> Response {
+    sv(s.journal.with_conn(|c| crate::strategies::export_pack(c)), StatusCode::OK)
+}
+
+pub async fn strategies_import_pack(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    sv(s.journal.with_conn(|c| crate::strategies::import_pack(c, &b)), StatusCode::CREATED)
+}
+
+/// Every API route with its method, purpose and the developer-token scope it needs ("launch token only" when
+/// none). Kept complete by a test that compares it with the router.
+pub const API_DOC: &[(&str, &str, &str)] = &[
+    ("GET", "/api/config", "App configuration and symbol lists"),
+    ("GET", "/api/scan", "Order-block scan of the NSE list"),
+    ("GET", "/api/chart/{symbol}", "Candles, zones and levels for one NSE symbol"),
+    ("GET", "/api/journal", "Closed trades and stats"),
+    ("POST", "/api/journal", "Add a hand-entered trade"),
+    ("DELETE", "/api/journal/{id}", "Delete a journal trade"),
+    ("GET", "/api/positions", "Open paper positions"),
+    ("POST", "/api/positions", "Open a paper position (risk-checked)"),
+    ("POST", "/api/positions/{id}/close", "Close a paper position"),
+    ("GET", "/api/audit", "Audit log"),
+    ("GET", "/api/settings", "Settings"),
+    ("PUT", "/api/settings", "Change settings"),
+    ("GET", "/api/accounts", "Accounts"),
+    ("POST", "/api/accounts", "Create a demo account or connect Binance"),
+    ("PATCH", "/api/accounts/{id}", "Rename a demo account or change its credits"),
+    ("DELETE", "/api/accounts/{id}", "Disconnect a broker account"),
+    ("GET", "/api/accounts/{id}/balances", "Broker balances (real, cached 10 s)"),
+    ("POST", "/api/accounts/{id}/verify", "Re-check a broker key"),
+    ("POST", "/api/accounts/{id}/reset", "Reset a demo account"),
+    ("GET", "/api/bots", "Bots with performance"),
+    ("POST", "/api/bots", "Create a bot"),
+    ("GET", "/api/bots/{id}", "One bot"),
+    ("PUT", "/api/bots/{id}", "Edit a bot (publishes a new strategy version)"),
+    ("DELETE", "/api/bots/{id}", "Delete a stopped bot"),
+    ("POST", "/api/bots/{id}/duplicate", "Copy a bot"),
+    ("POST", "/api/bots/{id}/start", "Start or resume (lifecycle-checked)"),
+    ("POST", "/api/bots/{id}/pause", "Pause: no new entries"),
+    ("POST", "/api/bots/{id}/stop", "Stop: keep_positions or close_positions"),
+    ("GET", "/api/bots/{id}/logs", "Bot log and orders"),
+    ("GET", "/api/bots/{id}/backtests", "Saved backtests of a bot"),
+    ("GET", "/api/bots/{id}/live", "Live-readiness checklist"),
+    ("POST", "/api/bots/{id}/deploy-live", "Check every live-deployment gate"),
+    ("POST", "/api/bots/{id}/approval", "Request approval of a live deployment"),
+    ("GET", "/api/approvals", "Approval requests"),
+    ("POST", "/api/approvals/{id}/decide", "Approve (typed phrase) or reject"),
+    ("POST", "/api/approvals/{id}/revoke", "Revoke an approval"),
+    ("GET", "/api/strategies/library", "Indicators and strategy templates"),
+    ("GET", "/api/strategies", "Strategy registry"),
+    ("POST", "/api/strategies", "Publish a strategy version"),
+    ("POST", "/api/strategies/import", "Import one exported strategy"),
+    ("GET", "/api/strategies/{id}/versions", "Versions of a strategy"),
+    ("GET", "/api/strategy-versions/{id}/export", "Export one version"),
+    ("GET", "/api/strategies/pack", "Export every strategy as a pack"),
+    ("POST", "/api/strategies/pack", "Import a strategy pack (all or nothing)"),
+    ("POST", "/api/backtest", "Run (and optionally save) a backtest"),
+    ("POST", "/api/backtest/optimize", "Grid search with an out-of-sample split"),
+    ("POST", "/api/backtest/walkforward", "Anchored walk-forward test"),
+    ("GET", "/api/backtests/{id}", "A saved backtest"),
+    ("GET", "/api/backtests/{id}/trades.csv", "A saved backtest's trades as CSV"),
+    ("GET", "/api/market-data/health", "Data quality and freshness of one series"),
+    ("GET", "/api/scanner", "Scan templates and unsupported feeds"),
+    ("POST", "/api/scanner/run", "Run a scan"),
+    ("GET", "/api/scanner/history", "Recent scans"),
+    ("GET", "/api/portfolio", "Portfolio, attribution, reconciliation"),
+    ("GET", "/api/portfolio/trades.csv", "Every trade as CSV"),
+    ("GET", "/api/risk", "Kill switch and live-gate status"),
+    ("POST", "/api/risk/kill", "Engage or release the kill switch"),
+    ("GET", "/api/risk/limits/{account}", "Account risk limits"),
+    ("PUT", "/api/risk/limits/{account}", "Set account risk limits"),
+    ("POST", "/api/live/arm", "Arm live trading (typed phrase; runtime only)"),
+    ("POST", "/api/live/disarm", "Disarm live trading"),
+    ("GET", "/api/system/health", "Runner heartbeat and reconciliation backlog"),
+    ("GET", "/api/ai/status", "AI assistant status and limits"),
+    ("PUT", "/api/ai/key", "Store the AI provider key in the vault"),
+    ("DELETE", "/api/ai/key", "Remove the AI provider key"),
+    ("POST", "/api/ai/settings", "AI on/off and model"),
+    ("POST", "/api/ai/draft", "Draft a strategy (validated, never auto-saved)"),
+    ("POST", "/api/ai/explain/{id}", "Explain a saved backtest from stored numbers"),
+    ("POST", "/api/ai/review", "Risk-review a strategy"),
+    ("GET", "/api/ai/proposals", "AI history"),
+    ("GET", "/api/dev/tokens", "Developer tokens"),
+    ("POST", "/api/dev/tokens", "Create a scoped developer token (shown once)"),
+    ("DELETE", "/api/dev/tokens/{id}", "Revoke a developer token"),
+    ("GET", "/api/openapi.json", "This description"),
+];
+
+pub async fn openapi() -> Json<Value> {
+    let mut paths = serde_json::Map::new();
+    for (m, p, summary) in API_DOC {
+        let scope = crate::devtokens::needed(m, &p.replace("{id}", "1").replace("{account}", "demo-1").replace("{symbol}", "SBIN"));
+        let e = paths.entry(p.to_string()).or_insert_with(|| json!({}));
+        e[m.to_lowercase()] = json!({ "summary": summary, "x-developer-token-scope": scope.unwrap_or("launch token only"), "responses": { "200": { "description": "JSON" }, "4XX": { "description": "{\"error\": \"...\"}" } } });
+    }
+    Json(json!({
+        "openapi": "3.0.3",
+        "info": { "title": "ZoneBoard local API", "version": env!("CARGO_PKG_VERSION"), "description": "Loopback only. Authenticate with the app's launch token (X-ZB-Token) or a scoped developer token (Authorization: Bearer zbk_...)." },
+        "servers": [{ "url": "http://127.0.0.1:5000" }],
+        "components": { "securitySchemes": { "launch": { "type": "apiKey", "in": "header", "name": "X-ZB-Token" }, "developer": { "type": "http", "scheme": "bearer" } } },
+        "paths": paths,
+    }))
+}

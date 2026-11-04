@@ -338,6 +338,12 @@ const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/api/system/health", "/api/system/health", None),
     ("GET", "/api/ai/status", "/api/ai/status", None),
     ("GET", "/api/scanner", "/api/scanner", None),
+    ("GET", "/api/dev/tokens", "/api/dev/tokens", None),
+    ("POST", "/api/dev/tokens", "/api/dev/tokens", Some(r#"{"name":"x","scopes":["read"]}"#)),
+    ("DELETE", "/api/dev/tokens/{id}", "/api/dev/tokens/999999", None),
+    ("GET", "/api/openapi.json", "/api/openapi.json", None),
+    ("GET", "/api/strategies/pack", "/api/strategies/pack", None),
+    ("POST", "/api/strategies/pack", "/api/strategies/pack", Some(r#"{}"#)),
     ("GET", "/api/portfolio", "/api/portfolio", None),
     ("GET", "/api/portfolio/trades.csv", "/api/portfolio/trades.csv", None),
     ("POST", "/api/scanner/run", "/api/scanner/run", Some(r#"{"template":"nope"}"#)),
@@ -1162,4 +1168,39 @@ async fn scanner_runs_on_sample_data_with_source_and_formula() {
     assert!(!out["results"].as_array().unwrap().is_empty());
     assert_eq!(send(&r, "POST", "/api/scanner/run", Some(json!({ "template": "gap", "market": "crypto" }))).await.0, StatusCode::BAD_REQUEST);
     assert_eq!(get_json(&r, "/api/scanner/history").await.1["runs"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn openapi_lists_every_route() {
+    let source = include_str!("../src/server.rs");
+    for (idx, _) in source.match_indices(".route(\"/api/") {
+        let rest = &source[idx + ".route(\"".len()..];
+        let path = &rest[..rest.find('"').unwrap()];
+        assert!(zoneboard::botapi::API_DOC.iter().any(|(_, p, _)| *p == path), "{path} is missing from API_DOC (openapi.json)");
+    }
+}
+
+#[tokio::test]
+async fn developer_tokens_are_scoped_and_cannot_reach_safety_controls() {
+    let r = router();
+    let (s, t) = send(&r, "POST", "/api/dev/tokens", Some(json!({ "name": "notebook", "scopes": ["read", "research"] }))).await;
+    assert_eq!(s, StatusCode::CREATED, "{t}");
+    let tok = t["token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {tok}");
+    let dev = |m: &'static str, uri: &'static str, body: Option<Value>| {
+        let (r, b) = (&r, bearer.clone());
+        async move { call_without_token(r, m, uri, "localhost", body, &[("Authorization", b.as_str())]).await.0 }
+    };
+    assert_eq!(dev("GET", "/api/bots", None).await, StatusCode::OK);
+    assert_eq!(dev("GET", "/api/openapi.json", None).await, StatusCode::OK);
+    assert_eq!(dev("POST", "/api/scanner/run", Some(json!({ "template": "movers", "market": "india" }))).await, StatusCode::OK);
+    assert_eq!(dev("POST", "/api/bots/1/start", None).await, StatusCode::FORBIDDEN, "no trade scope");
+    for (m, uri) in [("POST", "/api/live/arm"), ("POST", "/api/risk/kill"), ("GET", "/api/accounts"), ("POST", "/api/dev/tokens"), ("PUT", "/api/ai/key"), ("POST", "/api/approvals/1/decide")] {
+        assert_eq!(dev(m, uri, Some(json!({}))).await, StatusCode::FORBIDDEN, "{m} {uri}");
+    }
+    let (_, list) = get_json(&r, "/api/dev/tokens").await;
+    assert!(!list.to_string().contains(&tok), "the token is never shown again");
+    let id = t["id"].as_i64().unwrap();
+    assert_eq!(send(&r, "DELETE", &format!("/api/dev/tokens/{id}"), None).await.0, StatusCode::OK);
+    assert_eq!(dev("GET", "/api/bots", None).await, StatusCode::UNAUTHORIZED, "revoked");
 }

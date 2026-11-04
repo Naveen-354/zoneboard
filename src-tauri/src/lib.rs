@@ -13,6 +13,7 @@ pub mod bots;
 pub mod connections;
 pub mod data;
 pub mod db;
+pub mod devtokens;
 pub mod exchange;
 pub mod execution;
 pub mod indicators;

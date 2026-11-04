@@ -221,6 +221,19 @@
     <h2 class="sec-h">Security</h2>
     <div class="sec-list" id="setSecurity"></div>
   </section>
+  <section class="card page-card" id="devHub">
+    <h2 class="sec-h">Developer</h2>
+    <p class="st-about">Scoped API tokens for scripts and notebooks (Python SDK: <code>tools/sdk/zoneboard_client.py</code>; API description: <code>/api/openapi.json</code>). A token can never reach broker credentials, approvals, live arming, risk limits or the kill switch. Strategies are declarative JSON: no custom code runs inside ZoneBoard.</p>
+    <form class="acct-new" id="devNew" autocomplete="off">
+      <label>Token name<input name="name" type="text" maxlength="60" placeholder="My notebook"></label>
+      <label class="set-check"><input type="checkbox" name="read" checked> read</label>
+      <label class="set-check"><input type="checkbox" name="research"> research</label>
+      <label class="set-check"><input type="checkbox" name="trade"> trade (bots, paper orders)</label>
+      <button class="btn" type="submit">Create token</button>
+    </form>
+    <p class="set-msg" id="devMsg" role="status" aria-live="polite"></p>
+    <div class="table-wrap"><table><thead><tr><th>Name</th><th>Scopes</th><th>Token</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody id="devBody"></tbody></table></div>
+  </section>
   <section class="card page-card">
     <div class="sec-top"><h2 class="sec-h">Audit log</h2><span class="jsub" id="auditNote"></span><button class="btn ghost" id="auditRefresh" type="button">Refresh</button></div>
     <div class="table-wrap">
