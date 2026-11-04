@@ -1195,7 +1195,7 @@ async fn developer_tokens_are_scoped_and_cannot_reach_safety_controls() {
     assert_eq!(dev("GET", "/api/openapi.json", None).await, StatusCode::OK);
     assert_eq!(dev("POST", "/api/scanner/run", Some(json!({ "template": "movers", "market": "india" }))).await, StatusCode::OK);
     assert_eq!(dev("POST", "/api/bots/1/start", None).await, StatusCode::FORBIDDEN, "no trade scope");
-    for (m, uri) in [("POST", "/api/live/arm"), ("POST", "/api/risk/kill"), ("GET", "/api/accounts"), ("POST", "/api/dev/tokens"), ("PUT", "/api/ai/key"), ("POST", "/api/approvals/1/decide")] {
+    for (m, uri) in [("POST", "/api/live/arm"), ("POST", "/api/risk/kill"), ("GET", "/api/accounts"), ("POST", "/api/dev/tokens"), ("GET", "/api/dev/tokens"), ("PUT", "/api/ai/key"), ("POST", "/api/approvals/1/decide")] {
         assert_eq!(dev(m, uri, Some(json!({}))).await, StatusCode::FORBIDDEN, "{m} {uri}");
     }
     let (_, list) = get_json(&r, "/api/dev/tokens").await;

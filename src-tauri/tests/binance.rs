@@ -185,8 +185,12 @@ async fn testnet_bot_trades_through_the_outbox_without_duplicates() {
         let o = k.orders.get(&format!("zb{id}-1000-0")).expect("deterministic client order id");
         assert_eq!(o["executedQty"], "0.00212000", "quantity rounded down to the 0.00001 lot step");
     }
-    // the same intent again (a replayed step): not sent a second time
+    // the same intent again (a replayed step): not sent a second time. Counted at the exchange's door: Binance
+    // only refuses a reused client order id while that order is open, so ZoneBoard's outbox must stop it.
+    let sent = |k: &fake_binance::Shared| k.lock().unwrap().calls.iter().filter(|c| *c == "order").count();
+    assert_eq!(sent(&knobs), 1);
     assert_eq!(zoneboard::botapi::run_intents(&state, &b, vec![open(1_000)]).await, 0);
+    assert_eq!(sent(&knobs), 1, "the replayed intent never reached the exchange");
     assert_eq!(knobs.lock().unwrap().orders.len(), 1);
 
     // a lost reply: the order reached the exchange but the answer did not; the lookup records the fill
