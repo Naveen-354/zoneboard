@@ -182,6 +182,11 @@ pub fn log(conn: &Connection, bot: i64, level: &str, msg: &str) {
     );
 }
 
+/// Allocation plus the bot's realised P&L: the capital its sizing and limits are taken from.
+pub fn capital_of(conn: &Connection, b: &Bot) -> Result<Decimal, BotError> {
+    Ok(b.allocation + realised_total(conn, b.id)?)
+}
+
 fn realised_total(conn: &Connection, bot: i64) -> Result<Decimal, BotError> {
     let mut st = conn.prepare("SELECT side, qty, entry, exit, fees FROM trades WHERE bot_id = ?1")?;
     let rows: Vec<(String, f64, f64, f64, f64)> = st.query_map([bot], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.filter_map(Result::ok).collect();
@@ -191,6 +196,7 @@ fn realised_total(conn: &Connection, bot: i64) -> Result<Decimal, BotError> {
 // ------------------------------------------------------------------ validation
 
 struct Input {
+    mode: &'static str,
     name: String,
     description: String,
     avatar: Value,
@@ -286,18 +292,24 @@ fn parse_input(conn: &Connection, body: &Value, base: Option<&Bot>) -> Result<In
         ("crypto", "binance") | ("india", "fyers") => {}
         _ => return bad("crypto bots use Binance market data; NSE bots use FYERS (data via Yahoo, 15 min delayed, until the FYERS feed lands)"),
     }
-    let mode = text(&pm, "mode").unwrap_or_else(|| "demo".into());
-    match mode.as_str() {
-        "demo" => {}
-        "live" => {
-            return Err(BotError::Conflict(
-                "Live bots need a connected live broker account, and this build has none: the Binance and FYERS order connectors are not built yet. Create the bot in Demo mode; Bot Performance shows what live deployment still requires.".into(),
-            ))
-        }
-        _ => return bad("mode must be demo or live"),
+    let wanted = text(&pm, "mode").unwrap_or_else(|| "demo".into());
+    if !["demo", "live"].contains(&wanted.as_str()) {
+        return bad("mode must be demo or live");
     }
     let account_id = text(&pm, "account_id").filter(|s| !s.is_empty()).unwrap_or_else(|| crate::accounts::DEFAULT_ACCOUNT.into());
-    crate::accounts::require_demo(conn, &account_id).map_err(BotError::Invalid)?;
+    // The trading mode follows the account: a demo account is paper trading; a connected Binance account
+    // (Spot Testnet or live) is broker trading. The account, not a flag, decides.
+    let acct: Option<(String, i64)> = conn.query_row("SELECT kind, archived FROM accounts WHERE id = ?1", [&account_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let mode = match acct {
+        Some((k, 0)) if k == "demo" => {
+            if wanted == "live" {
+                return Err(BotError::Conflict("Live mode needs a connected broker account: connect Binance (testnet first) on the Accounts page, then pick it here.".into()));
+            }
+            "demo"
+        }
+        Some((k, 0)) if k == "binance" => "live",
+        _ => return bad("unknown, archived or unsupported account"),
+    };
     let symbol = text(&pm, "symbol").unwrap_or_default().to_uppercase();
     if !valid_symbol(&market, &symbol) {
         return bad(if market == "crypto" { "symbol must be a USDT pair like BTCUSDT" } else { "symbol must be an NSE symbol like SBIN" });
@@ -309,6 +321,14 @@ fn parse_input(conn: &Connection, body: &Value, base: Option<&Bot>) -> Result<In
     }
     let spec = pm.get("spec").cloned().unwrap_or(Value::Null);
     let parsed = strategy::parse(&spec).map_err(|e| BotError::Invalid(format!("strategy: {e}")))?;
+    if mode == "live" {
+        if market != "crypto" {
+            return bad("broker bots trade Binance spot (crypto) only");
+        }
+        if parsed.kind == Kind::Pairs || parsed.direction != strategy::Direction::Long {
+            return bad("on Binance spot a bot can only buy and sell what it holds: use a long-only strategy (no shorts, no pairs)");
+        }
+    }
     let symbol2 = text(&pm, "symbol2").filter(|s| !s.is_empty()).map(|s| s.to_uppercase());
     match (parsed.kind, &symbol2) {
         (Kind::Pairs, None) => return bad("a pairs strategy needs a second symbol"),
@@ -351,7 +371,7 @@ fn parse_input(conn: &Connection, body: &Value, base: Option<&Bot>) -> Result<In
             _ => return bad("slippage_pct must be between 0 and 2"),
         },
     };
-    Ok(Input { name, description, avatar, market, exchange, account_id, symbol, symbol2, interval, spec, template, source, allocation, max_daily_loss, max_open_positions, slippage_pct })
+    Ok(Input { mode, name, description, avatar, market, exchange, account_id, symbol, symbol2, interval, spec, template, source, allocation, max_daily_loss, max_open_positions, slippage_pct })
 }
 
 /// A field of an existing bot as the request would spell it (for partial updates).
@@ -389,16 +409,16 @@ pub fn create(conn: &mut Connection, body: &Value) -> Result<i64, BotError> {
     }
     let t = now();
     tx.execute(
-        &format!("INSERT INTO bots ({}) VALUES (?1,?2,?3,?4,?5,'demo',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'stopped','{{}}',NULL,NULL,NULL,?17,?17,NULL)", &COLS[4..]),
+        &format!("INSERT INTO bots ({}) VALUES (?1,?2,?3,?4,?5,?18,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'stopped','{{}}',NULL,NULL,NULL,?17,?17,NULL)", &COLS[4..]),
         params![
             i.name, i.description, i.avatar.to_string(), i.market, i.exchange, i.account_id, i.symbol, i.symbol2, i.interval, i.spec.to_string(), i.template, i.source,
-            dec_str(i.allocation), i.max_daily_loss.map(dec_str), i.max_open_positions, i.slippage_pct, t
+            dec_str(i.allocation), i.max_daily_loss.map(dec_str), i.max_open_positions, i.slippage_pct, t, i.mode
         ],
     )?;
     let id = tx.last_insert_rowid();
     let (vid, _, _) = crate::strategies::publish(&tx, &i.name, &i.spec, &format!("bot {id} created"), "user").map_err(BotError::Invalid)?;
     tx.execute("UPDATE bots SET strategy_version_id = ?1 WHERE id = ?2", params![vid, id])?;
-    crate::audit::record(&tx, "user", "bot_created", &format!("bot:{id}"), &json!({ "bot_id": id, "name": i.name, "market": i.market, "symbol": i.symbol, "interval": i.interval, "allocation": dec_str(i.allocation), "template": i.template, "source": i.source, "mode": "demo" }))?;
+    crate::audit::record(&tx, "user", "bot_created", &format!("bot:{id}"), &json!({ "bot_id": id, "name": i.name, "market": i.market, "symbol": i.symbol, "interval": i.interval, "allocation": dec_str(i.allocation), "template": i.template, "source": i.source, "mode": i.mode }))?;
     tx.commit()?;
     log(conn, id, "info", "bot created (stopped)");
     Ok(id)
@@ -417,11 +437,11 @@ pub fn update(conn: &mut Connection, id: i64, body: &Value) -> Result<(), BotErr
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
-        "UPDATE bots SET name=?1, description=?2, avatar=?3, market=?4, exchange=?5, account_id=?6, symbol=?7, symbol2=?8, interval=?9, spec=?10, template=?11, source=?12,
+        "UPDATE bots SET mode=?19, name=?1, description=?2, avatar=?3, market=?4, exchange=?5, account_id=?6, symbol=?7, symbol2=?8, interval=?9, spec=?10, template=?11, source=?12,
          allocation=?13, max_daily_loss=?14, max_open_positions=?15, slippage_pct=?16, updated_utc=?17 WHERE id=?18",
         params![
             i.name, i.description, i.avatar.to_string(), i.market, i.exchange, i.account_id, i.symbol, i.symbol2, i.interval, i.spec.to_string(), i.template, i.source,
-            dec_str(i.allocation), i.max_daily_loss.map(dec_str), i.max_open_positions, i.slippage_pct, now(), id
+            dec_str(i.allocation), i.max_daily_loss.map(dec_str), i.max_open_positions, i.slippage_pct, now(), id, i.mode
         ],
     )?;
     if structural {
@@ -484,6 +504,38 @@ pub fn set_status(conn: &Connection, id: i64, status: &str, reason: &str, actor:
     Ok(())
 }
 
+/// Bot lifecycle stages and the transitions allowed between them. Runtime status (running / paused /
+/// stopped) is separate: a stage says what the bot has earned, the status whether it is working.
+pub const STAGES: [&str; 6] = ["draft", "backtested", "paper", "pending_approval", "live", "error"];
+
+fn allowed(from: &str, to: &str) -> bool {
+    from == to
+        || to == "error"
+        || matches!(
+            (from, to),
+            ("draft", "backtested") | ("draft", "paper") | ("backtested", "paper") | ("paper", "pending_approval") | ("pending_approval", "live") | ("pending_approval", "paper") | ("live", "paper") | ("error", "draft") | ("error", "paper")
+        )
+}
+
+/// Move a bot to another stage. An invalid move is refused and the attempt is audited.
+pub fn transition(conn: &Connection, id: i64, to: &str, actor: &str) -> Result<(), BotError> {
+    let from: String = conn.query_row("SELECT stage FROM bots WHERE id = ?1", [id], |r| r.get(0)).optional()?.ok_or(BotError::NotFound)?;
+    if !allowed(&from, to) {
+        crate::audit::record(conn, actor, "bot_transition_rejected", &format!("bot:{id}"), &json!({ "bot_id": id, "from": from, "to": to }))?;
+        return Err(BotError::Conflict(format!("a bot cannot go from {from} to {to}")));
+    }
+    if from != to {
+        conn.execute("UPDATE bots SET stage = ?1 WHERE id = ?2", params![to, id])?;
+        crate::audit::record(conn, actor, "bot_stage", &format!("bot:{id}"), &json!({ "bot_id": id, "from": from, "to": to }))?;
+    }
+    Ok(())
+}
+
+/// A saved backtest of the current version moves a draft bot to `backtested`.
+pub fn mark_backtested(conn: &Connection, id: i64) {
+    let _ = conn.execute("UPDATE bots SET stage = 'backtested' WHERE id = ?1 AND stage = 'draft'", [id]);
+}
+
 /// `running` from `stopped` or `paused`. The engine re-baselines on the next tick (it acts from the next
 /// candle close), keeping grid lines, the DCA cycle and open positions.
 pub fn start(conn: &Connection, id: i64, gate: &Gate, sample: bool) -> Result<(), BotError> {
@@ -494,11 +546,28 @@ pub fn start(conn: &Connection, id: i64, gate: &Gate, sample: bool) -> Result<()
     if gate.killed() {
         return Err(BotError::Conflict("the kill switch is on: release it first".into()));
     }
-    if b.mode != "demo" {
-        return Err(BotError::Conflict("only demo bots can run in this build".into()));
-    }
-    crate::accounts::require_demo(conn, &b.account_id).map_err(BotError::Conflict)?;
     strategy::parse(&b.spec).map_err(|e| BotError::Invalid(format!("strategy: {e}")))?;
+    let (kind, env): (String, String) = conn.query_row("SELECT kind, environment FROM accounts WHERE id = ?1 AND archived = 0", [&b.account_id], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.ok_or_else(|| BotError::Conflict("the bot's account is gone or disconnected".into()))?;
+    let backtested: i64 = conn.query_row("SELECT count(*) FROM backtests WHERE bot_id = ?1 AND strategy_version_id = (SELECT strategy_version_id FROM bots WHERE id = ?1)", [id], |r| r.get(0))?;
+    match (kind.as_str(), env.as_str()) {
+        ("demo", _) => {}
+        ("binance", "testnet") => {
+            if backtested == 0 {
+                return Err(BotError::Conflict("save a backtest of this exact strategy version before trading it on the testnet".into()));
+            }
+        }
+        ("binance", "live") => {
+            if crate::approvals::valid_for(conn, id).map_err(BotError::Db)?.is_none() {
+                return Err(BotError::Conflict("no current approval matches this bot's exact configuration: request one in the Approval Center".into()));
+            }
+            if gate.armed().map(|(a, _)| a) != Some(b.account_id.clone()) {
+                return Err(BotError::Conflict("live trading is not armed for this account".into()));
+            }
+        }
+        _ => return Err(BotError::Conflict("unsupported account".into())),
+    }
+    let next_stage = if env == "live" { "live" } else { "paper" };
+    transition(conn, id, next_stage, "user")?;
     let mut st = b.state.clone();
     st.engine.pending.clear();
     st.engine.last_closed = None;
@@ -570,12 +639,16 @@ pub struct DbBook<'a> {
     gate: &'a Gate,
     symbols: [String; 2],
     pub events: usize,
+    /// Broker account: orders become intents, executed by `execution.rs` after the step.
+    broker: bool,
+    pub intents: Vec<crate::execution::Intent>,
 }
 
 impl<'a> DbBook<'a> {
     pub fn new(conn: &'a mut Connection, bot: &'a Bot, gate: &'a Gate) -> Self {
         let symbols = [bot.symbol.clone(), bot.symbol2.clone().unwrap_or_default()];
-        Self { conn, bot, gate, symbols, events: 0 }
+        let broker = conn.query_row("SELECT kind FROM accounts WHERE id = ?1", [&bot.account_id], |r| r.get::<_, String>(0)).map(|k| k == "binance").unwrap_or(false);
+        Self { conn, bot, gate, symbols, events: 0, broker, intents: vec![] }
     }
 
     fn lots_of(conn: &Connection, bot: i64) -> Result<Vec<Lot>, BotError> {
@@ -611,6 +684,10 @@ impl Book for DbBook<'_> {
         self.lots().iter().map(|l| l.qty * l.entry).sum()
     }
     fn open(&mut self, req: OpenReq) -> Result<i64, String> {
+        if self.broker {
+            self.intents.push(crate::execution::Intent::Open { qty: req.qty, ref_price: req.price, bar_time: req.time, stop: req.stop, target: req.target, trail: req.trail, tag: req.tag });
+            return Ok(0);
+        }
         let r = bot_ref(self.conn, self.bot).map_err(|e| format!("{e:?}"))?;
         let symbol = self.symbols[req.leg as usize].clone();
         let res = orders::open(self.conn, &r, &symbol, &req, self.gate);
@@ -622,6 +699,11 @@ impl Book for DbBook<'_> {
         res
     }
     fn close(&mut self, lot: i64, price: f64, time: i64, reason: &str) -> Result<(), String> {
+        if self.broker {
+            let _ = price;
+            self.intents.push(crate::execution::Intent::Close { position_id: lot, bar_time: time, reason: reason.to_string() });
+            return Ok(());
+        }
         let r = bot_ref(self.conn, self.bot).map_err(|e| format!("{e:?}"))?;
         let res = orders::close(self.conn, &r, lot, price, time, reason).map(|_| ());
         self.events += 1;
@@ -645,9 +727,14 @@ impl Book for DbBook<'_> {
 /// with `t + interval <= now` count as closed. Signals use closed bars; pending orders fill at the open of
 /// the first bar after the signal, as soon as that bar exists. Returns a short status line.
 pub fn process(conn: &mut Connection, gate: &Gate, id: i64, a: &Frame, b: Option<&Frame>, now: i64) -> Result<String, String> {
+    process_full(conn, gate, id, a, b, now).map(|(s, _)| s)
+}
+
+/// [`process`], also returning the broker intents of the step (empty for paper accounts).
+pub fn process_full(conn: &mut Connection, gate: &Gate, id: i64, a: &Frame, b: Option<&Frame>, now: i64) -> Result<(String, Vec<crate::execution::Intent>), String> {
     let bot = load(conn, id).map_err(|e| format!("{e:?}"))?;
     if !["running", "paused"].contains(&bot.status.as_str()) {
-        return Ok("not running".into());
+        return Ok(("not running".into(), vec![]));
     }
     let strat = strategy::parse(&bot.spec)?;
     let iv = interval_secs(&bot.interval).ok_or("bad interval")?;
@@ -674,7 +761,7 @@ pub fn process(conn: &mut Connection, gate: &Gate, id: i64, a: &Frame, b: Option
     };
     if closed_len < 2 {
         save(conn, &rs, None);
-        return Ok("waiting for closed candles".into());
+        return Ok(("waiting for closed candles".into(), vec![]));
     }
     let last_closed_t = fa.t[closed_len - 1];
     let Some(prev) = rs.engine.last_closed else {
@@ -682,7 +769,7 @@ pub fn process(conn: &mut Connection, gate: &Gate, id: i64, a: &Frame, b: Option
         rs.engine.last_opened = Some(last_closed_t);
         save(conn, &rs, None);
         log(conn, id, "info", &format!("watching {} {}: acts from the next candle close", bot.symbol, bot.interval));
-        return Ok("baseline set".into());
+        return Ok(("baseline set".into(), vec![]));
     };
     let first_new = fa.t.partition_point(|&t| t <= prev);
     let new_closed = closed_len.saturating_sub(first_new);
@@ -693,7 +780,7 @@ pub fn process(conn: &mut Connection, gate: &Gate, id: i64, a: &Frame, b: Option
         rs.engine.last_opened = Some(last_closed_t);
         save(conn, &rs, None);
         log(conn, id, "warn", &format!("{new_closed} candles closed since the last check (app asleep or no data): skipped, not replayed{}", if dropped > 0 { format!("; {dropped} pending order(s) dropped") } else { String::new() }));
-        return Ok("skipped a gap".into());
+        return Ok(("skipped a gap".into(), vec![]));
     }
     let closed_a = crate::backtest2::slice(fa, 0, closed_len);
     let closed_b = fb.map(|f| crate::backtest2::slice(f, 0, closed_len));
@@ -708,6 +795,7 @@ pub fn process(conn: &mut Connection, gate: &Gate, id: i64, a: &Frame, b: Option
     let trade = bot.status == "running" && !gate.killed() && !stale;
     let mut st = rs.engine.clone();
     let events;
+    let intents;
     {
         let mut book = DbBook::new(conn, &bot, gate);
         // Bar by bar from the first new one. A bar's open fills what the previous close decided (as soon as the
@@ -725,10 +813,11 @@ pub fn process(conn: &mut Connection, gate: &Gate, id: i64, a: &Frame, b: Option
             }
         }
         events = book.events;
+        intents = std::mem::take(&mut book.intents);
     }
     rs.engine = st;
     save(conn, &rs, None);
-    Ok(format!("{new_closed} new candle(s), {events} order event(s)"))
+    Ok((format!("{new_closed} new candle(s), {events} order event(s)"), intents))
 }
 
 fn now_iso() -> String {
@@ -909,7 +998,7 @@ mod tests {
         assert_eq!((b.status.as_str(), b.mode.as_str(), b.exchange.as_str()), ("stopped", "demo", "binance"));
         let mut live = body();
         live["mode"] = json!("live");
-        assert!(matches!(create(&mut c, &live), Err(BotError::Conflict(m)) if m.contains("Live bots")));
+        assert!(matches!(create(&mut c, &live), Err(BotError::Conflict(m)) if m.contains("broker account")));
         for (k, v) in [("symbol", json!("ETHBTC")), ("interval", json!("2h")), ("allocation", json!("-5")), ("source", json!("nope")), ("exchange", json!("fyers")), ("symbol2", json!("ETHUSDT")), ("spec", json!({"kind": "signal"}))] {
             let mut x = body();
             x[k] = v.clone();

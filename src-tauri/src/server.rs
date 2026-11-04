@@ -126,6 +126,18 @@ impl AppState {
         }))
     }
 
+    /// The journal (database), for integration tests and the runner.
+    #[doc(hidden)]
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
+    /// The kill switch and live arming, for integration tests.
+    #[doc(hidden)]
+    pub fn gate(&self) -> &crate::risk::Gate {
+        &self.gate
+    }
+
     /// Read-only accessor for the in-memory API token.
     #[doc(hidden)]
     pub fn api_token(&self) -> &str {
@@ -180,6 +192,11 @@ pub fn app(state: Shared) -> Router {
         .route("/api/bots/{id}/live", get(botapi::bot_readiness))
         .route("/api/bots/{id}/deploy-live", post(botapi::bot_deploy_live))
         .route("/api/market-data/health", get(botapi::market_health))
+        .route("/api/approvals", get(botapi::approvals_list))
+        .route("/api/bots/{id}/approval", post(botapi::approval_request))
+        .route("/api/approvals/{id}/decide", post(botapi::approval_decide))
+        .route("/api/approvals/{id}/revoke", post(botapi::approval_revoke))
+        .route("/api/system/health", get(botapi::system_health))
         .route("/api/backtest/walkforward", post(botapi::backtest_walkforward))
         .route("/api/backtests/{id}/trades.csv", get(botapi::backtest_csv))
         .route("/api/strategies", get(botapi::strategies_list).post(botapi::strategies_publish))

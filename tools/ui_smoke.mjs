@@ -253,7 +253,7 @@ const scenarios = [
     // live readiness: refused, with the reasons
     await p.eval(`document.querySelector('#stTabs [data-t=perf]').click()`);
     await p.waitFor(`document.querySelectorAll('.gate-list li').length >= 6`, "live-readiness checklist");
-    assert(await p.eval(`/Live order route built/.test(document.querySelector('.gate-list').textContent) && document.querySelector('.gate-list li.ok') !== null`), "checklist shows the saved backtest and the missing live route");
+    assert(await p.eval(`/order route built/.test(document.querySelector('.gate-list').textContent) && document.querySelector('.gate-list li.ok') !== null`), "checklist shows the saved backtest and the missing live route");
     assert(p.errors.length === 0, `console errors:\n    ${p.errors.join("\n    ")}`);
   }],
 

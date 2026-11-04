@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 /// The latest schema version supported by this application.
-pub const CURRENT_VERSION: u32 = 7;
+pub const CURRENT_VERSION: u32 = 8;
 
 /// Database error type covering schema version mismatches, SQLite errors, and IO issues.
 #[derive(Debug)]
@@ -461,6 +461,42 @@ pub fn migrate(conn: &mut Connection) -> Result<(), DbError> {
                 detail        TEXT NOT NULL DEFAULT '{}'
             );
             PRAGMA user_version = 7;",
+        )?;
+        tx.commit()?;
+        ver = 7;
+    }
+
+    if ver < 8 {
+        let tx = conn.transaction()?;
+        // Migration 8: the broker-order outbox. A row is written (status 'submitting') BEFORE an order is sent,
+        // keyed by a deterministic client order id, so a crash or a lost reply can be reconciled with the
+        // exchange instead of resending. The unique key makes a duplicate submission impossible.
+        tx.execute_batch(
+            "CREATE TABLE broker_orders (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id          INTEGER NOT NULL,
+                account_id      TEXT NOT NULL,
+                client_order_id TEXT NOT NULL UNIQUE,
+                symbol          TEXT NOT NULL,
+                side            TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
+                action          TEXT NOT NULL CHECK (action IN ('open','close')),
+                qty             TEXT NOT NULL,
+                position_id     INTEGER,
+                bar_time        INTEGER,
+                tag             TEXT NOT NULL DEFAULT '',
+                stop            REAL,
+                target          REAL,
+                trail           TEXT,
+                status          TEXT NOT NULL CHECK (status IN ('submitting','filled','rejected','unknown')),
+                broker_order_id TEXT,
+                executed_qty    TEXT,
+                avg_price       TEXT,
+                reason          TEXT NOT NULL DEFAULT '',
+                created_utc     TEXT NOT NULL,
+                updated_utc     TEXT NOT NULL
+            );
+            CREATE INDEX idx_broker_orders_status ON broker_orders(status);
+            PRAGMA user_version = 8;",
         )?;
         tx.commit()?;
     }

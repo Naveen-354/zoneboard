@@ -376,3 +376,4 @@ footer{padding:8px 18px 12px;color:var(--faint);font-size:11.5px}
 .replay{display:grid;gap:10px}
 .replay-pos{flex:1;min-width:160px}
 .replay-info{font-size:12.5px;color:var(--ink-2)}
+.appr{box-shadow:none}

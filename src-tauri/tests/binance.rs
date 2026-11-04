@@ -141,3 +141,77 @@ async fn live_needs_confirmation_and_withdrawal_keys_are_refused() {
     assert_eq!(s, StatusCode::CREATED, "{text}");
     assert_eq!(acct["environment"], "live");
 }
+
+
+/// A bot on a connected Spot Testnet account trades through the risk gate and the order outbox, against the
+/// fake exchange: deterministic client order ids, no duplicate on a repeated step, a lost reply reconciled by
+/// lookup, a close recorded from the exchange's fill, and the kill switch blocking new entries.
+#[tokio::test]
+async fn testnet_bot_trades_through_the_outbox_without_duplicates() {
+    use zoneboard::execution::Intent;
+    let (url, knobs) = fake_binance::spawn().await;
+    let state = AppState::with_parts(false, ":memory:", Arc::new(MemoryStore::new()), Endpoints { binance_testnet: url.clone(), binance_live: url }).unwrap();
+    let t = T { token: state.api_token().to_string(), router: app(state.clone()), vault: Arc::new(MemoryStore::new()), knobs: knobs.clone() };
+    let (s, acct, text) = call(&t, "POST", "/api/accounts", Some(connect_body("testnet"))).await;
+    assert_eq!(s, StatusCode::CREATED, "{text}");
+    let account = acct["id"].as_str().unwrap().to_string();
+
+    let spec = json!({ "entry": {"long": {"left": {"price": "close"}, "op": "gt", "right": {"value": 0}}}, "sizing": {"type": "fixed_notional", "value": 100} });
+    let (s, bot, text) = call(&t, "POST", "/api/bots", Some(json!({ "name": "Testnet bot", "symbol": "BTCUSDT", "interval": "1h", "spec": spec, "allocation": "1000", "account_id": account }))).await;
+    assert_eq!(s, StatusCode::CREATED, "{text}");
+    assert_eq!(bot["mode"], "live", "a broker account means broker trading");
+    let id = bot["id"].as_i64().unwrap();
+    // a short strategy cannot run on spot
+    let (s, _, _) = call(&t, "POST", "/api/bots", Some(json!({ "name": "Shorty", "symbol": "BTCUSDT", "spec": { "direction": "short", "entry": {"short": {"left": {"price": "close"}, "op": "gt", "right": {"value": 0}}} }, "allocation": "100", "account_id": account }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // the lifecycle: no testnet trading before a saved backtest of this exact version
+    let (s, e, _) = call(&t, "POST", &format!("/api/bots/{id}/start"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert!(e["error"].as_str().unwrap().contains("backtest"), "{e}");
+    let (s, _, text) = call(&t, "POST", "/api/backtest", Some(json!({ "bot_id": id, "bars": 300, "save": true, "sample": true }))).await;
+    assert_eq!(s, StatusCode::OK, "{text}");
+    let (s, b, text) = call(&t, "POST", &format!("/api/bots/{id}/start"), None).await;
+    assert_eq!(s, StatusCode::OK, "{text}");
+    assert_eq!(b["stage"], "paper");
+
+    let b = state.journal().with_conn(|c| zoneboard::bots::load(c, id)).unwrap();
+    let open = |bar: i64| Intent::Open { qty: 0.0021234, ref_price: 50_000.0, bar_time: bar, stop: None, target: None, trail: None, tag: "signal".into() };
+    let filled = zoneboard::botapi::run_intents(&state, &b, vec![open(1_000)]).await;
+    assert_eq!(filled, 1);
+    {
+        let k = knobs.lock().unwrap();
+        assert_eq!(k.orders.len(), 1);
+        let o = k.orders.get(&format!("zb{id}-1000-0")).expect("deterministic client order id");
+        assert_eq!(o["executedQty"], "0.00212000", "quantity rounded down to the 0.00001 lot step");
+    }
+    // the same intent again (a replayed step): not sent a second time
+    assert_eq!(zoneboard::botapi::run_intents(&state, &b, vec![open(1_000)]).await, 0);
+    assert_eq!(knobs.lock().unwrap().orders.len(), 1);
+
+    // a lost reply: the order reached the exchange but the answer did not; the lookup records the fill
+    knobs.lock().unwrap().drop_order_reply = true;
+    assert_eq!(zoneboard::botapi::run_intents(&state, &b, vec![open(2_000)]).await, 1);
+    knobs.lock().unwrap().drop_order_reply = false;
+    let (positions, live_mode): (i64, i64) = state.journal().with_conn(|c| {
+        (c.query_row("SELECT count(*) FROM positions WHERE bot_id = ?1", [id], |r| r.get(0)).unwrap(), c.query_row("SELECT count(*) FROM positions WHERE bot_id = ?1 AND mode = 'live' AND account_id = ?2", rusqlite::params![id, account], |r| r.get(0)).unwrap())
+    });
+    assert_eq!((positions, live_mode), (2, 2));
+
+    // close one: a SELL through the outbox, the trade recorded at the exchange's price
+    let pos: i64 = state.journal().with_conn(|c| c.query_row("SELECT min(id) FROM positions WHERE bot_id = ?1", [id], |r| r.get(0)).unwrap());
+    knobs.lock().unwrap().price = "51000".into();
+    assert_eq!(zoneboard::botapi::run_intents(&state, &b, vec![Intent::Close { position_id: pos, bar_time: 3_000, reason: "exit signal".into() }]).await, 1);
+    let (exit, side): (f64, String) = state.journal().with_conn(|c| c.query_row("SELECT exit, side FROM trades WHERE bot_id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap());
+    assert_eq!((exit, side.as_str()), (51_000.0, "long"));
+
+    // the kill switch blocks new entries before anything is sent
+    state.gate().set_kill(true);
+    assert_eq!(zoneboard::botapi::run_intents(&state, &b, vec![open(4_000)]).await, 0);
+    assert_eq!(knobs.lock().unwrap().orders.len(), 3, "2 opens + 1 close; nothing after the kill switch");
+    let refused: String = state.journal().with_conn(|c| c.query_row("SELECT reason FROM bot_orders WHERE bot_id = ?1 AND status = 'rejected' ORDER BY id DESC LIMIT 1", [id], |r| r.get(0)).unwrap());
+    assert!(refused.contains("kill switch"), "{refused}");
+    // the outbox has no order left in an uncertain state
+    let unknown: i64 = state.journal().with_conn(|c| c.query_row("SELECT count(*) FROM broker_orders WHERE status IN ('submitting','unknown')", [], |r| r.get(0)).unwrap());
+    assert_eq!(unknown, 0);
+}

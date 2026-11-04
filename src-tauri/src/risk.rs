@@ -131,9 +131,47 @@ pub fn check(conn: &Connection, o: &Order, gate: &Gate) -> Result<(), String> {
         return Err("this account is archived".into());
     }
     if kind != "demo" || env != "paper" {
-        // G1: no real-order path exists in this build. Even an armed, connected account stops here.
-        return Err("live order refused: this build has no live order route (no broker connector), so only paper accounts can trade".into());
+        // The paper order path never sends anything to a broker; broker orders go through `check_broker`.
+        return Err("live order refused: this is the paper order path; broker accounts trade only through approved bots".into());
     }
+    check_limits(conn, o)
+}
+
+/// Pre-trade checks for an order to a connected broker account. Testnet keys trade practice funds; a live
+/// account additionally needs live trading **armed for that account** and a **current approval** of the bot's
+/// exact scope. Fails closed on any doubt.
+pub fn check_broker(conn: &Connection, o: &Order, gate: &Gate, live_approved: bool) -> Result<(), String> {
+    if gate.killed() {
+        return Err("kill switch is on: no new orders until you release it".into());
+    }
+    let row: Option<(String, String, i64)> = conn
+        .query_row("SELECT kind, environment, archived FROM accounts WHERE id = ?1", [&o.account_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((kind, env, archived)) = row else { return Err(format!("unknown account {}", o.account_id)) };
+    if kind != "binance" || archived != 0 {
+        return Err("not a connected Binance account".into());
+    }
+    match env.as_str() {
+        "testnet" => {}
+        "live" => {
+            if gate.armed().map(|(a, _)| a) != Some(o.account_id.clone()) {
+                return Err("live trading is not armed for this account (Bot Studio > Risk: type the confirmation). Arming resets on every restart.".into());
+            }
+            if !live_approved {
+                return Err("this bot has no current approval for live trading in its exact configuration".into());
+            }
+            if !limits_complete(conn, &o.account_id) {
+                return Err("set this account's max order size, daily loss and exposure limits first".into());
+            }
+        }
+        _ => return Err("unknown account environment".into()),
+    }
+    check_limits(conn, o)
+}
+
+/// Account and bot limits, shared by the paper and broker paths.
+fn check_limits(conn: &Connection, o: &Order) -> Result<(), String> {
     let currency = accounts::currency_for(&o.market, &o.symbol)?;
     let need = accounts::notional(o.qty, o.price).ok_or("order size is too large")?;
     let (max_order, max_loss, max_exp) = limits(conn, &o.account_id, currency)?;
@@ -257,18 +295,19 @@ pub fn live_status(conn: &Connection, gate: &Gate) -> Result<Value, String> {
     let armed = gate.armed();
     let limited = live.iter().any(|(id, _)| limits_complete(conn, id));
     let items = vec![
-        json!({ "id": "connector", "ok": false, "label": "Live order route built", "detail": "Not in this build. The Binance (T007, T025, T080) and FYERS (T060) order connectors do not exist yet, so no code path can send a real order." }),
+        json!({ "id": "connector", "ok": true, "label": "Binance order route built", "detail": "Spot MARKET orders through the risk engine, with client-order-id idempotency and reconciliation. Tested against a fake exchange only; never against live Binance. FYERS orders are not built." }),
         json!({ "id": "account", "ok": !live.is_empty(), "label": "A live broker account is connected", "detail": if live.is_empty() { "None connected." } else { "Connected." } }),
         json!({ "id": "limits", "ok": limited, "label": "Account limits set (max order size, daily loss, exposure)", "detail": "Set on the live account in Bot Studio > Bot Performance > Risk." }),
         json!({ "id": "kill", "ok": !gate.killed(), "label": "Kill switch released", "detail": if gate.killed() { "The kill switch is on." } else { "Off." } }),
         json!({ "id": "armed", "ok": armed.is_some(), "label": "Live trading armed with the typed confirmation", "detail": "Runtime only: disarmed after every restart." }),
     ];
+    let can = !live.is_empty() && limited && !gate.killed() && armed.is_some();
     Ok(json!({
-        "can_trade_live": false,
+        "can_trade_live": can,
         "armed": armed.map(|(a, t)| json!({ "account_id": a, "since": t })),
         "kill_switch": gate.killed(),
         "checklist": items,
-        "summary": "Live trading is not available in this build: bots run on the demo account only (virtual funds, real prices).",
+        "summary": if can { "Live trading is armed. A bot still needs a current approval of its exact configuration before it can trade live." } else { "Live trading is not armed. Bots trade the demo account (virtual funds) or a connected Binance Spot Testnet account (practice funds)." },
     }))
 }
 
@@ -329,6 +368,37 @@ mod tests {
         o.account_id = "bn-1".into();
         assert!(check(&c, &o, &g).unwrap_err().contains("live order refused"));
         assert_eq!(live_status(&c, &g).unwrap()["can_trade_live"], false);
+    }
+
+    #[test]
+    fn broker_live_orders_need_arming_approval_and_limits() {
+        let mut c = conn();
+        for (id, env) in [("bn-live-1", "live"), ("bn-test-1", "testnet")] {
+            c.execute("INSERT INTO accounts (id, kind, label, environment, status, created_utc, archived) VALUES (?1,'binance','B',?2,'active','x',0)", [id, env]).unwrap();
+        }
+        let g = Gate::default();
+        let mut o = order(0.01, 100.0);
+        o.account_id = "bn-live-1".into();
+        assert!(check_broker(&c, &o, &g, true).unwrap_err().contains("not armed"));
+        g.arm("bn-live-1");
+        assert!(check_broker(&c, &o, &g, false).unwrap_err().contains("approval"));
+        assert!(check_broker(&c, &o, &g, true).unwrap_err().contains("limits"));
+        set_limits(&mut c, "bn-live-1", &json!({ "USDT": { "max_order_notional": "100", "max_daily_loss": "10", "max_exposure": "200" } })).unwrap();
+        assert!(check_broker(&c, &o, &g, true).is_ok(), "armed, approved, limits set");
+        o.qty = 2.0; // 200 notional
+        assert!(check_broker(&c, &o, &g, true).unwrap_err().contains("max order size"), "limits still bind");
+        o.qty = 0.01;
+        g.set_kill(true);
+        assert!(check_broker(&c, &o, &g, true).unwrap_err().contains("kill switch"));
+        g.set_kill(false);
+        assert!(check_broker(&c, &o, &g, true).unwrap_err().contains("not armed"), "the kill switch disarmed live trading");
+        // testnet: practice funds, no arming needed; the paper path still refuses broker accounts
+        o.account_id = "bn-test-1".into();
+        assert!(check_broker(&c, &o, &g, false).is_ok());
+        assert!(check(&c, &o, &g).is_err());
+        // a demo account is not a broker account
+        o.account_id = "demo-1".into();
+        assert!(check_broker(&c, &o, &g, true).is_err());
     }
 
     #[test]

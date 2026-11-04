@@ -158,38 +158,34 @@ function market() {
     el("b", null, draft.market === "crypto" ? "Binance" : "FYERS"),
     el("small", null, draft.market === "crypto" ? "Binance public market data (live)." : "NSE data via Yahoo, about 15 min delayed, until the FYERS feed is built."),
   );
+  const accts = ctx.accounts.filter((a) => draft.market === "crypto" || a.kind === "demo");
   const acct = select(
-    ctx.accounts.map((a) => ({ value: a.id, label: `${a.label} (VIRTUAL)` })),
+    accts.map((a) => ({ value: a.id, label: a.kind === "demo" ? `${a.label} · DEMO (virtual)` : `${a.label} · ${a.environment === "live" ? "LIVE (real money)" : "TESTNET"}` })),
     draft.account_id,
-    (v) => (draft.account_id = v),
-  );
-  const mode = seg(
-    [
-      { value: "demo", label: "Demo" },
-      { value: "live", label: "Live" },
-    ],
-    draft.mode,
     (v) => {
-      draft.mode = v;
+      draft.account_id = v;
+      draft.mode = ctx.accounts.find((a) => a.id === v)?.kind === "demo" ? "demo" : "live";
       render(host);
     },
   );
-  g.append(field("Market", mk), field("Exchange", exch), field("Symbol", sym), field("Timeframe", iv), field("Trading mode", mode), field("Account", acct, "Bots trade a demo account: virtual funds, real prices."));
+  const a = ctx.accounts.find((x) => x.id === draft.account_id);
+  const modeNote = !a || a.kind === "demo" ? "Demo: paper trading with virtual funds at real prices." : a.environment === "live" ? "Live: real orders on your Binance account, only after an approval of this exact bot and with live trading armed." : "Binance Spot Testnet: real orders with practice funds, after a saved backtest.";
+  g.append(field("Market", mk), field("Exchange", exch), field("Symbol", sym), field("Timeframe", iv), field("Account (decides the trading mode)", acct, modeNote));
   if (kindOf(draft.spec) === "pairs") {
     const s2 = input(draft.symbol2 || "", { maxlength: 20, list: "stSymbols", placeholder: draft.market === "crypto" ? "ETHUSDT" : "ICICIBANK" });
     s2.addEventListener("input", () => (draft.symbol2 = s2.value.trim().toUpperCase()));
     g.append(field("Second symbol (pair leg B)", s2));
   }
   const parts = [g, dl];
-  if (draft.mode === "live") parts.push(liveNote());
+  if (a && a.kind !== "demo") parts.push(liveNote(a));
   return card("2 · Market", null, ...parts);
 }
 
-function liveNote() {
+function liveNote(a) {
   const n = el("div", "st-live-note");
   n.append(
-    el("b", null, "Live trading is not available in this build."),
-    el("p", null, "No live broker account can be connected yet (the Binance and FYERS order connectors are not built), so a bot cannot be saved in Live mode. Save it as Demo, backtest it and forward-test it; Bot Performance shows the live-readiness checklist."),
+    el("b", null, a.environment === "live" ? "This bot would trade REAL money on Binance." : "This bot sends real orders to the Binance Spot Testnet (practice funds)."),
+    el("p", null, "Spot only: long-only strategies, no shorts or pairs. Every order passes the risk engine. " + (a.environment === "live" ? "It cannot start until you approve this exact configuration in the Approval Center and arm live trading; any later change needs a new approval." : "It cannot start until a backtest of this exact strategy version is saved.")),
   );
   return n;
 }
@@ -698,7 +694,7 @@ function actions() {
   const bar = el("div", "st-actions");
   const msg = el("p", "st-msg");
   msg.setAttribute("role", "status");
-  const save = button(editingId ? "Save changes" : "Create bot (Demo)", "btn", async () => {
+  const save = button(editingId ? "Save changes" : draft.mode === "live" ? "Create bot (broker account)" : "Create bot (Demo)", "btn", async () => {
     say(msg, "Saving…");
     save.disabled = true;
     try {
@@ -710,11 +706,10 @@ function actions() {
     } catch (e) {
       say(msg, e.message, "err");
     } finally {
-      save.disabled = draft.mode === "live";
+      save.disabled = false;
     }
   });
-  save.disabled = draft.mode === "live";
-  if (draft.mode === "live") save.title = "Live mode cannot be saved in this build";
+
   const bt = button("Backtest this strategy", "btn ghost", () => ctx.goBacktest(current()));
   const reset = button("New blank bot", "btn ghost", () => load(blank()));
   bar.append(save, bt, reset, msg);
@@ -723,7 +718,7 @@ function actions() {
 
 export async function refreshAccounts() {
   try {
-    ctx.accounts = (await api("/api/accounts")).accounts.filter((a) => a.kind === "demo" && !a.archived);
+    ctx.accounts = (await api("/api/accounts")).accounts.filter((a) => !a.archived);
   } catch {
     /* keep the old list */
   }

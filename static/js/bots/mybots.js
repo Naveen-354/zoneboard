@@ -18,7 +18,7 @@ const cur = (b) => (b.market === "crypto" ? "USDT" : "INR");
 // ---------------------------------------------------------------- My Bots
 
 export function renderMine(host, risk) {
-  host.replaceChildren(fleetHead(risk), killCard(risk), fleet());
+  host.replaceChildren(fleetHead(risk), healthLine(), killCard(risk), fleet());
 }
 
 function fleetHead(risk) {
@@ -44,6 +44,18 @@ function fleetHead(risk) {
   return wrap;
 }
 
+function healthLine() {
+  const p = el("p", "st-about", "Runner: checking…");
+  api("/api/system/health")
+    .then((h) => {
+      const r = h.runner;
+      p.textContent = `Runner ${r.healthy ? "healthy" : r.heartbeat_utc ? "NOT RESPONDING" : "not started yet"}${r.age_s != null ? ` (last beat ${r.age_s} s ago)` : ""} · ${h.bots.running} running, ${h.bots.paused} paused · ${h.unreconciled_broker_orders} broker order(s) awaiting reconciliation`;
+      p.className = "st-about" + (r.heartbeat_utc && !r.healthy ? " dn" : "");
+    })
+    .catch(() => (p.textContent = "Runner status unavailable."));
+  return p;
+}
+
 function killCard(risk) {
   const c = el("section", "card st-card st-kill");
   const on = !!risk?.kill_switch;
@@ -62,7 +74,7 @@ function killCard(risk) {
     }
   });
   const live = el("div", "st-live-chip");
-  live.append(badge("LIVE: NOT AVAILABLE", "off"), el("small", null, "No live order route in this build. Arming is runtime-only and resets on restart."));
+  live.append(badge(risk?.armed ? `LIVE ARMED: ${risk.armed.account_id}` : "LIVE: DISARMED", risk?.armed ? "warn" : "off"), el("small", null, "Arming is runtime only and resets on every restart. Arm it under Bot Performance → Live readiness."));
   c.append(b, live, msg);
   return c;
 }
@@ -85,7 +97,10 @@ function botCard(b) {
   const hd = el("div", "bot-h");
   const t = el("div", "bot-t");
   t.append(el("b", null, b.name), el("small", null, `${b.symbol}${b.symbol2 ? " / " + b.symbol2 : ""} · ${b.interval} · ${b.market === "crypto" ? "Binance" : "NSE"} · ${b.spec?.kind || "signal"}`));
-  hd.append(avatar(b.avatar, b.name), t, statusBadge(b.status), badge("DEMO · VIRTUAL", "info"));
+  const env = b.mode === "demo" ? badge("DEMO · VIRTUAL", "info") : badge(b.account_id.startsWith("bn-live") ? "LIVE · REAL MONEY" : "BINANCE TESTNET", b.account_id.startsWith("bn-live") ? "warn" : "ok");
+  hd.append(avatar(b.avatar, b.name), t, statusBadge(b.status), env);
+  const ver = b.strategy_version ? `strategy v${b.strategy_version.version} · ${b.strategy_version.hash.slice(0, 8)}` : "no version";
+  t.append(el("small", null, `stage ${b.stage} · ${ver}`));
   const s = el("div", "bot-stats");
   const kv = (k, v, cls) => {
     const d = el("div");
@@ -130,9 +145,13 @@ function botCard(b) {
   if (b.status !== "stopped")
     ctl.append(
       act("Stop", "btn ghost sm", async () => {
-        if (p.open_positions.length && !confirm(`Stop ${b.name} and close its ${p.open_positions.length} position(s) at the latest price?`)) throw new Error("cancelled");
-        await post(`/api/bots/${b.id}/stop`);
-      }, "Close the bot's positions at the latest price and stop"),
+        let policy = "keep_positions";
+        if (p.open_positions.length) {
+          const close = confirm(`Stop ${b.name}.\n\nOK: also CLOSE its ${p.open_positions.length} position(s) at the market now.\nCancel: stop and KEEP the positions open (close them yourself later).`);
+          policy = close ? "close_positions" : "keep_positions";
+        }
+        await post(`/api/bots/${b.id}/stop`, { policy });
+      }, "Stop the bot; you choose whether its positions close or stay open"),
     );
   ctl.append(
     button("Details", "btn ghost sm", () => ctx.openPerf(b.id)),
@@ -301,17 +320,45 @@ function readiness(b, r) {
     list.append(li);
   }
   const msg = el("p", "st-msg");
-  const dep = button("Deploy to a live account", "btn ghost", async () => {
+  const dep = button("Check live deployment", "btn ghost", async () => {
     try {
-      await post(`/api/bots/${b.id}/deploy-live`);
+      const r = await post(`/api/bots/${b.id}/deploy-live`);
+      say(msg, `Every gate passes: ${r.next}.`, "ok");
     } catch (e) {
       say(msg, `${e.message}. Nothing was sent anywhere.`, "err");
     }
   });
-  dep.title = "Checks the gates; refused in this build";
+  dep.title = "Checks every gate";
+  const phrase = input("", { placeholder: "ARM LIVE TRADING", "aria-label": "arming phrase" });
   const bar = el("div", "st-actions");
-  bar.append(dep, msg);
-  c.append(list, bar);
+  bar.append(
+    dep,
+    button("Request approval", "btn ghost sm", async () => {
+      try {
+        await post(`/api/bots/${b.id}/approval`);
+        say(msg, "Approval requested: decide it in the Approval Center.", "ok");
+      } catch (e) {
+        say(msg, e.message, "err");
+      }
+    }),
+  );
+  const arm = el("div", "st-actions");
+  arm.append(
+    phrase,
+    button("Arm live trading for this bot's account", "btn ghost sm", async () => {
+      try {
+        await post("/api/live/arm", { account_id: b.account_id, confirm: phrase.value.trim() });
+        say(msg, "Armed until you disarm or restart.", "ok");
+      } catch (e) {
+        say(msg, e.message, "err");
+      }
+    }),
+    button("Disarm", "btn ghost sm", async () => {
+      await post("/api/live/disarm");
+      say(msg, "Disarmed.", "ok");
+    }),
+  );
+  c.append(list, bar, arm, msg);
   return c;
 }
 

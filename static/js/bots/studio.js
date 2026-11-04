@@ -6,6 +6,7 @@ import * as builder from "./builder.js";
 import * as backtest from "./backtest.js";
 import * as mybots from "./mybots.js";
 import * as replay from "./replay.js";
+import * as approvals from "./approvals.js";
 
 const TABS = [
   ["explore", "Explore Bots"],
@@ -14,6 +15,7 @@ const TABS = [
   ["library", "Strategy Library"],
   ["backtest", "Backtesting"],
   ["replay", "Market Replay"],
+  ["approvals", "Approval Center"],
   ["perf", "Bot Performance"],
 ];
 const KEY = "zoneboard.studio.tab";
@@ -118,7 +120,7 @@ async function refresh(repaint) {
   try {
     const [b, a, r] = await Promise.all([api("/api/bots"), api("/api/accounts"), api("/api/risk")]);
     ctx.bots = b.bots;
-    ctx.accounts = a.accounts.filter((x) => x.kind === "demo" && !x.archived);
+    ctx.accounts = a.accounts.filter((x) => !x.archived);
     ctx.risk = r;
   } catch (e) {
     $("#stNote").textContent = `Can't refresh: ${e.message}`;
@@ -154,6 +156,7 @@ function paint() {
   else if (tab === "library") body.replaceChildren(library());
   else if (tab === "backtest") backtest.render(body);
   else if (tab === "replay") replay.render(body);
+  else if (tab === "approvals") approvals.render(body, ctx);
   else if (tab === "perf") mybots.renderPerf(body);
 }
 

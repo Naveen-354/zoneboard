@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::backtest2::{self, Axis, Config};
@@ -122,13 +122,30 @@ async fn prices_for(s: &Shared, b: &bots::Bot) -> [Option<f64>; 2] {
     [a, bb]
 }
 
-pub async fn bot_stop(State(s): State<Shared>, Path(id): Path<i64>) -> Response {
+/// `POST /api/bots/{id}/stop` with `{"policy": "keep_positions" | "close_positions"}`. The default keeps
+/// positions open (they show on the Board / in the account to close by hand): a normal stop never liquidates
+/// silently. Closing must be asked for; only the kill switch closes everything on its own.
+pub async fn bot_stop(State(s): State<Shared>, Path(id): Path<i64>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let body = json_body(&headers, &body);
+    let close = match body.get("policy").and_then(Value::as_str).unwrap_or("keep_positions") {
+        "keep_positions" => false,
+        "close_positions" => true,
+        _ => return err(StatusCode::BAD_REQUEST, "policy must be keep_positions or close_positions"),
+    };
     let b = match s.journal.with_conn(|c| bots::load(c, id)) {
         Ok(b) => b,
         Err(e) => return bot_err(e),
     };
-    let prices = prices_for(&s, &b).await;
-    match s.journal.with_conn(|c| bots::stop(c, id, prices, "stopped by you", "user")) {
+    let broker = s.journal.with_conn(|c| c.query_row("SELECT kind FROM accounts WHERE id = ?1", [&b.account_id], |r| r.get::<_, String>(0)).map(|k| k == "binance").unwrap_or(false));
+    if close && broker {
+        // broker positions close with real SELL orders through the outbox
+        let lots: Vec<i64> = s.journal.with_conn(|c| c.prepare("SELECT id FROM positions WHERE bot_id = ?1").and_then(|mut st| st.query_map([id], |r| r.get(0)).map(|m| m.filter_map(Result::ok).collect())).unwrap_or_default());
+        let t = chrono::Utc::now().timestamp();
+        let intents = lots.into_iter().map(|p| crate::execution::Intent::Close { position_id: p, bar_time: t, reason: "stopped by you".into() }).collect();
+        run_intents(&s, &b, intents).await;
+    }
+    let prices = if close && !broker { prices_for(&s, &b).await } else { [None, None] };
+    match s.journal.with_conn(|c| bots::stop(c, id, prices, if close { "stopped by you (positions closed)" } else { "stopped by you (positions kept)" }, "user")) {
         Ok(summary) => match s.journal.with_conn(|c| bots::load(c, id).and_then(|b| bots::to_json(c, &b, true))) {
             Ok(mut v) => {
                 v["stop"] = summary;
@@ -159,7 +176,14 @@ pub async fn bot_readiness(State(s): State<Shared>, Path(id): Path<i64>) -> Resp
 /// `POST /api/bots/{id}/deploy-live`: always refused in this build, with the checklist saying why.
 pub async fn bot_deploy_live(State(s): State<Shared>, Path(id): Path<i64>) -> Response {
     match s.journal.with_conn(|c| bots::load(c, id).and_then(|b| bots::readiness(c, &b, &s.gate))) {
-        Ok(v) => (StatusCode::CONFLICT, Json(json!({ "error": "live deployment is not available in this build: no live order route exists", "readiness": v }))).into_response(),
+        Ok(v) => {
+            let ok = v["checklist"].as_array().is_some_and(|l| l.iter().all(|x| x["ok"] == true));
+            if ok {
+                Json(json!({ "ok": true, "readiness": v, "next": "every gate passes: start the bot to trade live" })).into_response()
+            } else {
+                (StatusCode::CONFLICT, Json(json!({ "error": "not every live-deployment gate passes yet", "readiness": v }))).into_response()
+            }
+        }
         Err(e) => bot_err(e),
     }
 }
@@ -397,6 +421,7 @@ pub async fn backtest_run(State(s): State<Shared>, headers: HeaderMap, body: axu
             )?;
             let id = c.last_insert_rowid();
             if let Some(bid) = r.bot_id {
+                bots::mark_backtested(c, bid);
                 bots::log(c, bid, "info", &format!("backtest #{id} saved: {} trades, return {}%", report.metrics.trades, report.metrics.return_pct));
             }
             Ok(id)
@@ -502,7 +527,13 @@ pub async fn risk_kill(State(s): State<Shared>, headers: HeaderMap, body: axum::
         let ids = s.journal.with_conn(|c| bots::ids_with_status(c, &["running", "paused"]));
         for id in ids {
             let Ok(bot) = s.journal.with_conn(|c| bots::load(c, id)) else { continue };
-            let prices = prices_for(&s, &bot).await;
+            let broker = s.journal.with_conn(|c| c.query_row("SELECT kind FROM accounts WHERE id = ?1", [&bot.account_id], |r| r.get::<_, String>(0)).map(|k| k == "binance").unwrap_or(false));
+            if broker {
+                let lots: Vec<i64> = s.journal.with_conn(|c| c.prepare("SELECT id FROM positions WHERE bot_id = ?1").and_then(|mut st| st.query_map([id], |r| r.get(0)).map(|m| m.filter_map(Result::ok).collect())).unwrap_or_default());
+                let t = chrono::Utc::now().timestamp();
+                run_intents(&s, &bot, lots.into_iter().map(|p| crate::execution::Intent::Close { position_id: p, bar_time: t, reason: "kill switch".into() }).collect()).await;
+            }
+            let prices = if broker { [None, None] } else { prices_for(&s, &bot).await };
             if let Ok(v) = s.journal.with_conn(|c| bots::stop(c, id, prices, "kill switch", "user")) {
                 stopped.push(json!({ "bot_id": id, "name": bot.name, "result": v }));
             }
@@ -546,7 +577,40 @@ fn due(b: &bots::Bot, now: i64) -> bool {
     }
 }
 
+/// Execute a broker bot's intents through the risk gate and the order outbox (see `execution.rs`).
+pub async fn run_intents(s: &Shared, b: &bots::Bot, intents: Vec<crate::execution::Intent>) -> usize {
+    let (client, env) = match crate::connections::client_for(s, &b.account_id) {
+        Ok(x) => x,
+        Err(_) => {
+            s.journal.with_conn(|c| bots::log(c, b.id, "error", "the bot's broker account is not usable (disconnected or credentials missing): orders not sent"));
+            return 0;
+        }
+    };
+    let (approved, capital) = s.journal.with_conn(|c| (env == "live" && crate::approvals::valid_for(c, b.id).ok().flatten().is_some(), bots::capital_of(c, b).unwrap_or(b.allocation)));
+    let ctx = crate::execution::BotCtx { bot_id: b.id, bot_name: b.name.clone(), account_id: b.account_id.clone(), symbol: b.symbol.clone(), capital, max_daily_loss: b.max_daily_loss, max_open_positions: b.max_open_positions, live_approved: approved };
+    crate::execution::execute(&client, &s.gate, &ctx, intents, |f: &mut dyn FnMut(&mut rusqlite::Connection)| s.journal.with_conn(|c| f(c))).await
+}
+
+/// Ask the exchange about any order left `submitting` or `unknown` (a crash or a lost reply).
+async fn reconcile_all(s: &Shared) {
+    let accounts: Vec<String> = s.journal.with_conn(|c| {
+        c.prepare("SELECT DISTINCT account_id FROM broker_orders WHERE status IN ('submitting','unknown')").and_then(|mut st| st.query_map([], |r| r.get(0)).map(|m| m.filter_map(Result::ok).collect())).unwrap_or_default()
+    });
+    for a in accounts {
+        if let Ok((client, _)) = crate::connections::client_for(s, &a) {
+            let r = crate::execution::reconcile(&client, &a, |f: &mut dyn FnMut(&mut rusqlite::Connection)| s.journal.with_conn(|c| f(c))).await;
+            tracing::info!(account = %a, summary = %r, "broker orders reconciled");
+        }
+    }
+}
+
+fn heartbeat(s: &Shared, detail: Value) {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let _ = s.journal.with_conn(|c| c.execute("INSERT INTO workers (name, started_utc, heartbeat_utc, detail) VALUES ('bot-runner', ?1, ?1, ?2) ON CONFLICT(name) DO UPDATE SET heartbeat_utc = excluded.heartbeat_utc, detail = excluded.detail", params![now, detail.to_string()]));
+}
+
 pub async fn tick(s: &Shared) {
+    reconcile_all(s).await;
     let now = chrono::Utc::now().timestamp();
     let ids = s.journal.with_conn(|c| bots::ids_with_status(c, &["running", "paused"]));
     for id in ids {
@@ -560,9 +624,18 @@ pub async fn tick(s: &Shared) {
             None => None,
         };
         let res = match (fa, fb) {
-            (Ok(a), None) => s.journal.with_conn(|c| bots::process(c, &s.gate, id, &a, None, now)),
-            (Ok(a), Some(Ok(bb))) => s.journal.with_conn(|c| bots::process(c, &s.gate, id, &a, Some(&bb), now)),
+            (Ok(a), None) => s.journal.with_conn(|c| bots::process_full(c, &s.gate, id, &a, None, now)),
+            (Ok(a), Some(Ok(bb))) => s.journal.with_conn(|c| bots::process_full(c, &s.gate, id, &a, Some(&bb), now)),
             (Err(e), _) | (_, Some(Err(e))) => Err(format!("market data: {e}")),
+        };
+        let res = match res {
+            Ok((msg, intents)) => {
+                if !intents.is_empty() {
+                    run_intents(s, &b, intents).await;
+                }
+                Ok(msg)
+            }
+            Err(e) => Err(e),
         };
         if let Err(e) = res {
             s.journal.with_conn(|c| {
@@ -582,7 +655,10 @@ pub async fn run_forever(s: Shared) {
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         every.tick().await;
+        let t = std::time::Instant::now();
         tick(&s).await;
+        let running = s.journal.with_conn(|c| bots::ids_with_status(c, &["running", "paused"]).len());
+        heartbeat(&s, json!({ "bots_active": running, "tick_ms": t.elapsed().as_millis() as u64, "every_s": RUNNER_EVERY.as_secs() }));
     }
 }
 
@@ -693,4 +769,56 @@ pub async fn strategy_export(State(s): State<Shared>, Path(id): Path<i64>) -> Re
 pub async fn strategies_import(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     let b = json_body(&headers, &body);
     sv(s.journal.with_conn(|c| crate::strategies::import(c, &b)), StatusCode::CREATED)
+}
+
+// ------------------------------------------------------------------ approvals
+
+fn ap(r: Result<Value, String>) -> Response {
+    match r {
+        Ok(v) => Json(v).into_response(),
+        Err(e) if e.starts_with("no such") => err(StatusCode::NOT_FOUND, &e),
+        Err(e) => err(StatusCode::CONFLICT, &e),
+    }
+}
+
+pub async fn approvals_list(State(s): State<Shared>) -> Response {
+    ap(s.journal.with_conn(|c| crate::approvals::list(c)))
+}
+
+pub async fn approval_request(State(s): State<Shared>, Path(id): Path<i64>) -> Response {
+    ap(s.journal.with_conn(|c| crate::approvals::request(c, id, "user")))
+}
+
+pub async fn approval_decide(State(s): State<Shared>, Path(id): Path<i64>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    let approve = b.get("approve").and_then(Value::as_bool).unwrap_or(false);
+    let phrase = b.get("confirm").and_then(Value::as_str).unwrap_or("");
+    let reason = b.get("reason").and_then(Value::as_str).unwrap_or("");
+    ap(s.journal.with_conn(|c| crate::approvals::decide(c, id, approve, phrase, reason, "user")))
+}
+
+pub async fn approval_revoke(State(s): State<Shared>, Path(id): Path<i64>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    let reason = b.get("reason").and_then(Value::as_str).unwrap_or("revoked by you").to_string();
+    ap(s.journal.with_conn(|c| crate::approvals::revoke(c, id, &reason)))
+}
+
+/// `GET /api/system/health`: the runner's heartbeat, bot counts and safety state.
+pub async fn system_health(State(s): State<Shared>) -> Response {
+    let r = s.journal.with_conn(|c| -> rusqlite::Result<Value> {
+        let hb: Option<(String, String)> = c.query_row("SELECT heartbeat_utc, detail FROM workers WHERE name = 'bot-runner'", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let age = hb.as_ref().and_then(|(t, _)| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| chrono::Utc::now().timestamp() - t.timestamp());
+        let unknown: i64 = c.query_row("SELECT count(*) FROM broker_orders WHERE status IN ('submitting','unknown')", [], |r| r.get(0))?;
+        Ok(json!({
+            "runner": { "heartbeat_utc": hb.as_ref().map(|x| x.0.clone()), "age_s": age, "healthy": age.is_some_and(|a| a < 90), "detail": hb.and_then(|x| serde_json::from_str::<Value>(&x.1).ok()) },
+            "bots": { "running": bots::ids_with_status(c, &["running"]).len(), "paused": bots::ids_with_status(c, &["paused"]).len() },
+            "unreconciled_broker_orders": unknown,
+            "kill_switch": s.gate.killed(),
+            "live_armed": s.gate.armed().is_some(),
+        }))
+    });
+    match r {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
