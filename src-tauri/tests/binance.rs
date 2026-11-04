@@ -24,7 +24,7 @@ struct T {
 async fn setup() -> T {
     let (url, knobs) = fake_binance::spawn().await;
     let vault = Arc::new(MemoryStore::new());
-    let state = AppState::with_parts(true, ":memory:", vault.clone(), Endpoints { binance_testnet: url.clone(), binance_live: url }).unwrap();
+    let state = AppState::with_parts(true, ":memory:", vault.clone(), Endpoints { binance_testnet: url.clone(), binance_live: url, ..Endpoints::default() }).unwrap();
     T { token: state.api_token().to_string(), router: app(state), vault, knobs }
 }
 
@@ -150,7 +150,7 @@ async fn live_needs_confirmation_and_withdrawal_keys_are_refused() {
 async fn testnet_bot_trades_through_the_outbox_without_duplicates() {
     use zoneboard::execution::Intent;
     let (url, knobs) = fake_binance::spawn().await;
-    let state = AppState::with_parts(false, ":memory:", Arc::new(MemoryStore::new()), Endpoints { binance_testnet: url.clone(), binance_live: url }).unwrap();
+    let state = AppState::with_parts(false, ":memory:", Arc::new(MemoryStore::new()), Endpoints { binance_testnet: url.clone(), binance_live: url, ..Endpoints::default() }).unwrap();
     let t = T { token: state.api_token().to_string(), router: app(state.clone()), vault: Arc::new(MemoryStore::new()), knobs: knobs.clone() };
     let (s, acct, text) = call(&t, "POST", "/api/accounts", Some(connect_body("testnet"))).await;
     assert_eq!(s, StatusCode::CREATED, "{text}");

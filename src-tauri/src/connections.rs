@@ -30,11 +30,13 @@ pub const WITHDRAW_MSG: &str = "This key can withdraw funds. Create a key with R
 pub struct Endpoints {
     pub binance_testnet: String,
     pub binance_live: String,
+    /// The AI provider (Anthropic Messages API).
+    pub anthropic: String,
 }
 
 impl Default for Endpoints {
     fn default() -> Self {
-        Self { binance_testnet: crate::exchange::binance::TESTNET_URL.into(), binance_live: crate::exchange::binance::LIVE_URL.into() }
+        Self { binance_testnet: crate::exchange::binance::TESTNET_URL.into(), binance_live: crate::exchange::binance::LIVE_URL.into(), anthropic: "https://api.anthropic.com".into() }
     }
 }
 

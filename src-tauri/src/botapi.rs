@@ -822,3 +822,67 @@ pub async fn system_health(State(s): State<Shared>) -> Response {
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
+
+// ------------------------------------------------------------------ AI research
+
+fn ai_out(r: Result<Value, String>) -> Response {
+    match r {
+        Ok(v) => Json(v).into_response(),
+        Err(e) if e.starts_with("no such") => err(StatusCode::NOT_FOUND, &e),
+        Err(e) if e.contains("no AI key") || e.contains("switched off") || e.contains("budget") => err(StatusCode::CONFLICT, &e),
+        Err(e) if e.contains("provider") || e.contains("in time") || e.contains("reach") => err(StatusCode::BAD_GATEWAY, &e),
+        Err(e) => err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+pub async fn ai_status(State(s): State<Shared>) -> Response {
+    Json(crate::ai::status(&s)).into_response()
+}
+
+pub async fn ai_key_put(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    match crate::ai::set_key(&s, b.get("api_key").and_then(Value::as_str).unwrap_or("")) {
+        Ok(()) => Json(crate::ai::status(&s)).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+pub async fn ai_key_delete(State(s): State<Shared>) -> Response {
+    crate::ai::delete_key(&s);
+    Json(crate::ai::status(&s)).into_response()
+}
+
+/// `POST /api/ai/settings {"enabled": bool, "model": "..."}`: the owner's off switch and model choice.
+pub async fn ai_settings(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    if let Some(e) = b.get("enabled").and_then(Value::as_bool) {
+        s.ai.enabled.store(e, std::sync::atomic::Ordering::SeqCst);
+    }
+    if let Some(m) = b.get("model").and_then(Value::as_str) {
+        let m = m.trim();
+        if m.is_empty() || m.len() > 80 || !m.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c)) {
+            return err(StatusCode::BAD_REQUEST, "model must be a model id like claude-sonnet-5-5");
+        }
+        *s.ai.model.lock().unwrap() = m.to_string();
+    }
+    let _ = s.journal.with_conn(|c| crate::audit::record(c, "user", "ai_settings", "ai", &json!({ "enabled": s.ai.enabled.load(std::sync::atomic::Ordering::SeqCst), "model": *s.ai.model.lock().unwrap() })));
+    Json(crate::ai::status(&s)).into_response()
+}
+
+pub async fn ai_draft(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    ai_out(crate::ai::draft(&s, b.get("objective").and_then(Value::as_str).unwrap_or("")).await)
+}
+
+pub async fn ai_explain(State(s): State<Shared>, Path(id): Path<i64>) -> Response {
+    ai_out(crate::ai::explain(&s, id).await)
+}
+
+pub async fn ai_review(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let b = json_body(&headers, &body);
+    ai_out(crate::ai::review(&s, b.get("spec").unwrap_or(&Value::Null)).await)
+}
+
+pub async fn ai_proposals(State(s): State<Shared>) -> Response {
+    ai_out(s.journal.with_conn(|c| crate::ai::proposals(c)))
+}

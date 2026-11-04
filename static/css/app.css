@@ -377,3 +377,7 @@ footer{padding:8px 18px 12px;color:var(--faint);font-size:11.5px}
 .replay-pos{flex:1;min-width:160px}
 .replay-info{font-size:12.5px;color:var(--ink-2)}
 .appr{box-shadow:none}
+.ai-out{white-space:pre-wrap;font:12.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--bg);border-radius:9px;padding:10px;margin:6px 0;max-height:360px;overflow:auto}
+.ai-prop{display:grid;gap:6px}
+.ai-hist{display:grid;gap:6px}
+.ai-hist summary{font-size:12.5px;cursor:pointer}

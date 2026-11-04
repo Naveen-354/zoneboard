@@ -2,6 +2,7 @@
 //! The desktop window (`main.rs`), the headless server and the backtest CLI are thin shells around this.
 
 pub mod accounts;
+pub mod ai;
 pub mod approvals;
 pub mod audit;
 pub mod backtest;

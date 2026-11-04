@@ -7,6 +7,7 @@ import * as backtest from "./backtest.js";
 import * as mybots from "./mybots.js";
 import * as replay from "./replay.js";
 import * as approvals from "./approvals.js";
+import * as ai from "./ai.js";
 
 const TABS = [
   ["explore", "Explore Bots"],
@@ -15,6 +16,7 @@ const TABS = [
   ["library", "Strategy Library"],
   ["backtest", "Backtesting"],
   ["replay", "Market Replay"],
+  ["ai", "AI Research"],
   ["approvals", "Approval Center"],
   ["perf", "Bot Performance"],
 ];
@@ -78,6 +80,8 @@ export function wire() {
       builder.load({ ...draft, template: null }, editing || null);
       go("create");
     },
+    currentDraft: () => builder.current(),
+    blankDraft: () => builder.blank(),
     onSaved: async (bot) => {
       await refresh(false);
       mybots.openPerf(bot.id);
@@ -87,6 +91,7 @@ export function wire() {
   backtest.init(ctx);
   mybots.init(ctx);
   replay.init(ctx);
+  ai.init(ctx);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && !$("#botsView").hidden) refresh(false);
   });
@@ -157,6 +162,7 @@ function paint() {
   else if (tab === "backtest") backtest.render(body);
   else if (tab === "replay") replay.render(body);
   else if (tab === "approvals") approvals.render(body, ctx);
+  else if (tab === "ai") ai.render(body);
   else if (tab === "perf") mybots.renderPerf(body);
 }
 

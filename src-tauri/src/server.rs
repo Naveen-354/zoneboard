@@ -11,7 +11,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::{FixedOffset, Utc};
@@ -88,6 +88,7 @@ pub struct AppState {
     pub(crate) vault: Arc<dyn crate::vault::SecretStore>,
     pub(crate) endpoints: crate::connections::Endpoints,
     pub(crate) conn_cache: crate::connections::Cache,
+    pub(crate) ai: crate::ai::AiState,
 }
 
 pub type Shared = Arc<AppState>;
@@ -123,6 +124,7 @@ impl AppState {
             vault,
             endpoints,
             conn_cache: crate::connections::Cache::default(),
+            ai: crate::ai::AiState::default(),
         }))
     }
 
@@ -197,6 +199,13 @@ pub fn app(state: Shared) -> Router {
         .route("/api/approvals/{id}/decide", post(botapi::approval_decide))
         .route("/api/approvals/{id}/revoke", post(botapi::approval_revoke))
         .route("/api/system/health", get(botapi::system_health))
+        .route("/api/ai/status", get(botapi::ai_status))
+        .route("/api/ai/key", put(botapi::ai_key_put).delete(botapi::ai_key_delete))
+        .route("/api/ai/settings", post(botapi::ai_settings))
+        .route("/api/ai/draft", post(botapi::ai_draft))
+        .route("/api/ai/explain/{id}", post(botapi::ai_explain))
+        .route("/api/ai/review", post(botapi::ai_review))
+        .route("/api/ai/proposals", get(botapi::ai_proposals))
         .route("/api/backtest/walkforward", post(botapi::backtest_walkforward))
         .route("/api/backtests/{id}/trades.csv", get(botapi::backtest_csv))
         .route("/api/strategies", get(botapi::strategies_list).post(botapi::strategies_publish))
