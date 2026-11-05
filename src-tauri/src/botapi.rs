@@ -420,6 +420,7 @@ pub async fn backtest_run(State(s): State<Shared>, headers: HeaderMap, body: axu
                 params![r.bot_id, now, request.to_string(), serde_json::to_string(&report.metrics).unwrap(), stored.to_string(), vid, backtest2::ENGINE_VERSION, ds_hash],
             )?;
             let id = c.last_insert_rowid();
+            crate::events::emit(c, "BacktestCompleted", &format!("backtest:{id}"), json!({ "backtest_id": id, "bot_id": r.bot_id, "trades": report.metrics.trades, "return_pct": report.metrics.return_pct }), None, Some(&format!("bt:{id}")));
             if let Some(bid) = r.bot_id {
                 bots::mark_backtested(c, bid);
                 bots::log(c, bid, "info", &format!("backtest #{id} saved: {} trades, return {}%", report.metrics.trades, report.metrics.return_pct));
@@ -657,6 +658,7 @@ pub async fn run_forever(s: Shared) {
         every.tick().await;
         let t = std::time::Instant::now();
         tick(&s).await;
+        crate::opsapi::housekeeping(&s);
         let running = s.journal.with_conn(|c| bots::ids_with_status(c, &["running", "paused"]).len());
         heartbeat(&s, json!({ "bots_active": running, "tick_ms": t.elapsed().as_millis() as u64, "every_s": RUNNER_EVERY.as_secs() }));
     }
@@ -1119,6 +1121,26 @@ pub const API_DOC: &[(&str, &str, &str)] = &[
     ("POST", "/api/dev/tokens", "Create a scoped developer token (shown once)"),
     ("DELETE", "/api/dev/tokens/{id}", "Revoke a developer token"),
     ("GET", "/api/openapi.json", "This description"),
+    ("GET", "/api/monitor", "Infrastructure health, incidents, request metrics"),
+    ("PUT", "/api/monitor/thresholds", "Change monitor thresholds"),
+    ("GET", "/api/events", "Typed event log"),
+    ("GET", "/api/notifications", "Notifications (grouped)"),
+    ("POST", "/api/notifications/read", "Mark notifications read"),
+    ("GET", "/api/risk/portfolio", "Portfolio-wide risk view"),
+    ("PUT", "/api/risk/portfolio", "Portfolio-wide limits"),
+    ("PUT", "/api/risk/limits/{account}/extra", "Per-symbol, open-position and deny-list limits"),
+    ("GET", "/api/attribution", "P&L attribution by a dimension"),
+    ("GET", "/api/attribution/trades/{id}", "One trade with orders, fills and slippage"),
+    ("GET", "/api/drift/{id}", "Evaluate a bot's drift against its baseline"),
+    ("PUT", "/api/drift/config", "Drift thresholds"),
+    ("POST", "/api/drift/{id}/autopause", "Opt a bot in or out of drift auto-pause"),
+    ("GET", "/api/strategy-versions/{id}", "A version with tags and links"),
+    ("GET", "/api/strategy-versions/{id}/diff/{other}", "Differences between two versions"),
+    ("POST", "/api/strategy-versions/{id}/tags", "Tag a version"),
+    ("POST", "/api/strategy-versions/{id}/rollback", "Roll back (publishes a new version)"),
+    ("GET", "/api/jobs", "Background jobs"),
+    ("GET", "/api/jobs/{id}", "A job with its result"),
+    ("POST", "/api/jobs/{id}/cancel", "Cancel a job"),
 ];
 
 pub async fn openapi() -> Json<Value> {

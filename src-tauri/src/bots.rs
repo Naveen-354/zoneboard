@@ -426,6 +426,14 @@ pub fn create(conn: &mut Connection, body: &Value) -> Result<i64, BotError> {
 
 pub fn update(conn: &mut Connection, id: i64, body: &Value) -> Result<(), BotError> {
     let b = load(conn, id)?;
+    // concurrent edits: a request that says which revision it edited is refused if someone saved since
+    let mut body = body.clone();
+    let expected = body.as_object_mut().and_then(|m| m.remove("revision")).and_then(|v| v.as_i64());
+    let current: i64 = conn.query_row("SELECT revision FROM bots WHERE id = ?1", [id], |r| r.get(0))?;
+    if expected.is_some_and(|e| e != current) {
+        return Err(BotError::Conflict(format!("this bot was changed elsewhere (revision {current}, you edited {}): reload it and apply your change again", expected.unwrap_or(0))));
+    }
+    let body = &body;
     if b.status == "running" {
         return Err(BotError::Conflict("pause or stop the bot before editing it".into()));
     }
@@ -437,7 +445,7 @@ pub fn update(conn: &mut Connection, id: i64, body: &Value) -> Result<(), BotErr
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
-        "UPDATE bots SET mode=?19, name=?1, description=?2, avatar=?3, market=?4, exchange=?5, account_id=?6, symbol=?7, symbol2=?8, interval=?9, spec=?10, template=?11, source=?12,
+        "UPDATE bots SET revision = revision + 1, mode=?19, name=?1, description=?2, avatar=?3, market=?4, exchange=?5, account_id=?6, symbol=?7, symbol2=?8, interval=?9, spec=?10, template=?11, source=?12,
          allocation=?13, max_daily_loss=?14, max_open_positions=?15, slippage_pct=?16, updated_utc=?17 WHERE id=?18",
         params![
             i.name, i.description, i.avatar.to_string(), i.market, i.exchange, i.account_id, i.symbol, i.symbol2, i.interval, i.spec.to_string(), i.template, i.source,
@@ -501,6 +509,7 @@ pub fn set_status(conn: &Connection, id: i64, status: &str, reason: &str, actor:
     conn.execute("UPDATE bots SET status = ?1, started_utc = ?2, updated_utc = ?3 WHERE id = ?4", params![status, started, now(), id])?;
     crate::audit::record(conn, actor, &format!("bot_{status}"), &format!("bot:{id}"), &json!({ "bot_id": id, "from": b.status, "to": status, "reason": reason }))?;
     log(conn, id, "info", &format!("{} -> {status}: {reason}", b.status));
+    crate::events::emit(conn, "BotStateChanged", &format!("bot:{id}"), json!({ "bot_id": id, "from": b.status, "to": status, "reason": reason }), None, None);
     Ok(())
 }
 
@@ -919,6 +928,7 @@ pub fn to_json(conn: &Connection, b: &Bot, with_perf: bool) -> Result<Value, Bot
     });
     let (vid, stage): (Option<i64>, String) = conn.query_row("SELECT strategy_version_id, stage FROM bots WHERE id = ?1", [b.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
     v["stage"] = json!(stage);
+    v["revision"] = json!(conn.query_row("SELECT revision FROM bots WHERE id = ?1", [b.id], |r| r.get::<_, i64>(0))?);
     v["strategy_version"] = match vid {
         Some(id) => crate::strategies::version(conn, id).map_err(BotError::Db)?.map(|x| json!({ "id": x["id"], "name": x["name"], "version": x["version"], "hash": x["hash"] })).unwrap_or(Value::Null),
         None => Value::Null,

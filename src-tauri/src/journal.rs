@@ -343,6 +343,8 @@ pub fn close_in(tx: &Connection, id: i64, price: f64, date: Option<String>, note
     )
     .map_err(db)?;
     let trade_id = tx.last_insert_rowid();
+    // the trade keeps the exact strategy version that opened it
+    tx.execute("UPDATE trades SET strategy_version_id = (SELECT strategy_version_id FROM positions WHERE id = ?1) WHERE id = ?2", params![id, trade_id]).map_err(db)?;
     tx.execute("DELETE FROM positions WHERE id = ?1", [id]).map_err(db)?;
     // Release the funds and apply the P&L in the same transaction as the trade and the delete.
     if let Some(account) = &pos.account_id {

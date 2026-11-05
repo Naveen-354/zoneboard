@@ -62,6 +62,7 @@ pub fn publish(conn: &Connection, name: &str, spec: &Value, note: &str, actor: &
     )
     .map_err(|e| e.to_string())?;
     let vid = conn.last_insert_rowid();
+    crate::events::emit(conn, "StrategyVersionCreated", &format!("strategy:{sid}"), json!({ "strategy_id": sid, "version": next, "hash": h }), None, Some(&format!("sv:{sid}:{h}")));
     crate::audit::record(conn, actor, "strategy_version_published", &format!("strategy:{sid}"), &json!({ "strategy_id": sid, "name": name, "version": next, "hash": h })).map_err(|e| e.to_string())?;
     Ok((vid, next, h))
 }
@@ -127,6 +128,91 @@ pub fn import(conn: &Connection, doc: &Value) -> Result<Value, String> {
     let name = doc.get("name").and_then(Value::as_str).unwrap_or("Imported strategy");
     let (vid, v, h) = publish(conn, name, spec, "imported", "user")?;
     Ok(json!({ "version_id": vid, "version": v, "hash": h }))
+}
+
+pub const TAGS: [&str; 4] = ["experimental", "validated", "paper-approved", "production-approved"];
+
+/// Every difference between two specs: (JSON pointer, value in a, value in b). Missing = null.
+pub fn diff_values(a: &Value, b: &Value) -> Vec<Value> {
+    fn walk(a: &Value, b: &Value, path: String, out: &mut Vec<Value>) {
+        match (a, b) {
+            (Value::Object(x), Value::Object(y)) => {
+                let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+                keys.sort();
+                keys.dedup();
+                for k in keys {
+                    walk(x.get(k).unwrap_or(&Value::Null), y.get(k).unwrap_or(&Value::Null), format!("{path}/{k}"), out);
+                }
+            }
+            (Value::Array(x), Value::Array(y)) => {
+                for i in 0..x.len().max(y.len()) {
+                    walk(x.get(i).unwrap_or(&Value::Null), y.get(i).unwrap_or(&Value::Null), format!("{path}/{i}"), out);
+                }
+            }
+            _ if a != b => out.push(json!({ "path": if path.is_empty() { "/".into() } else { path }, "from": a, "to": b })),
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    walk(a, b, String::new(), &mut out);
+    out
+}
+
+pub fn diff(conn: &Connection, a: i64, b: i64) -> Result<Value, String> {
+    let va = version(conn, a)?.ok_or("no such strategy version")?;
+    let vb = version(conn, b)?.ok_or("no such strategy version")?;
+    let changes = diff_values(&va["spec"], &vb["spec"]);
+    let kind = |p: &str| if p.starts_with("/indicators") && p.contains("/params/") { "parameter" } else if p.starts_with("/entry") || p.starts_with("/exit") || p.starts_with("/indicators") || p == "/kind" || p == "/direction" { "logic" } else { "configuration" };
+    let changes: Vec<Value> = changes.into_iter().map(|mut c| {
+        let k = kind(c["path"].as_str().unwrap_or(""));
+        c["kind"] = json!(k);
+        c
+    }).collect();
+    Ok(json!({ "from": { "id": a, "name": va["name"], "version": va["version"] }, "to": { "id": b, "name": vb["name"], "version": vb["version"] }, "changes": changes }))
+}
+
+/// Tag a version. `production-approved` needs an approved live-deployment approval of that exact version.
+pub fn tag(conn: &Connection, vid: i64, tag: &str) -> Result<Value, String> {
+    if !TAGS.contains(&tag) {
+        return Err(format!("tag must be one of {}", TAGS.join(", ")));
+    }
+    version(conn, vid)?.ok_or("no such strategy version")?;
+    if tag == "production-approved" {
+        let n: i64 = conn.query_row("SELECT count(*) FROM approvals WHERE strategy_version_id = ?1 AND status = 'approved'", [vid], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("production-approved needs an approved live deployment of this exact version (Approval Center)".into());
+        }
+    }
+    conn.execute("INSERT OR IGNORE INTO strategy_tags (version_id, tag, created_utc) VALUES (?1,?2,?3)", params![vid, tag, now()]).map_err(|e| e.to_string())?;
+    crate::audit::record(conn, "user", "strategy_version_tagged", &format!("strategy_version:{vid}"), &json!({ "version_id": vid, "tag": tag })).map_err(|e| e.to_string())?;
+    detail(conn, vid)
+}
+
+/// Roll back by publishing a NEW version with an earlier version's logic. History is never rewritten; the new
+/// version's notes say where it came from (which also gives it its own content hash).
+pub fn rollback(conn: &Connection, vid: i64) -> Result<Value, String> {
+    let v = version(conn, vid)?.ok_or("no such strategy version")?;
+    let mut spec = v["spec"].clone();
+    let latest: i64 = conn.query_row("SELECT max(version) FROM strategy_versions WHERE strategy_id = ?1", [v["strategy_id"].as_i64()], |r| r.get(0)).map_err(|e| e.to_string())?;
+    spec["notes"] = json!(format!("rollback to v{} (from v{latest})", v["version"]));
+    let (nid, n, h) = publish(conn, v["name"].as_str().unwrap_or(""), &spec, &format!("rollback to v{}", v["version"]), "user")?;
+    crate::audit::record(conn, "user", "strategy_rolled_back", &format!("strategy:{}", v["strategy_id"]), &json!({ "from_version": latest, "to_logic_of": v["version"], "new_version": n })).map_err(|e| e.to_string())?;
+    Ok(json!({ "version_id": nid, "version": n, "hash": h }))
+}
+
+/// A version with its tags and everything that used it: bots, backtests, approvals, trades.
+pub fn detail(conn: &Connection, vid: i64) -> Result<Value, String> {
+    let mut v = version(conn, vid)?.ok_or("no such strategy version")?;
+    let list = |sql: &str| -> Vec<Value> {
+        conn.prepare(sql).and_then(|mut st| st.query_map([vid], |r| r.get::<_, i64>(0)).map(|m| m.filter_map(Result::ok).map(|x| json!(x)).collect())).unwrap_or_default()
+    };
+    let tags: Vec<String> = conn.prepare("SELECT tag FROM strategy_tags WHERE version_id = ?1 ORDER BY tag").and_then(|mut st| st.query_map([vid], |r| r.get(0)).map(|m| m.filter_map(Result::ok).collect())).unwrap_or_default();
+    v["tags"] = json!(tags);
+    v["bots"] = json!(list("SELECT id FROM bots WHERE strategy_version_id = ?1"));
+    v["backtests"] = json!(list("SELECT id FROM backtests WHERE strategy_version_id = ?1"));
+    v["approvals"] = json!(list("SELECT id FROM approvals WHERE strategy_version_id = ?1"));
+    v["trades"] = json!(conn.query_row("SELECT count(*) FROM trades WHERE strategy_version_id = ?1", [vid], |r| r.get::<_, i64>(0)).unwrap_or(0));
+    Ok(v)
 }
 
 pub const PACK_FORMAT: &str = "zoneboard-pack";
@@ -214,6 +300,44 @@ mod tests {
         let mut future = doc;
         future["schema"] = json!(99);
         assert!(import(&c2, &future).unwrap_err().contains("schema"));
+    }
+
+    #[test]
+    fn diff_tags_rollback_and_trade_links() {
+        let mut c = crate::db::open(":memory:").unwrap();
+        let (v1, _, _) = publish(&c, "RSI", &spec(), "", "user").unwrap();
+        let mut s2 = spec();
+        s2["indicators"][0]["params"]["period"] = json!(10);
+        s2["direction"] = json!("long");
+        s2["stop_loss"]["value"] = json!(7);
+        let (v2, _, _) = publish(&c, "RSI", &s2, "", "user").unwrap();
+        let d = diff(&c, v1, v2).unwrap();
+        let kinds: Vec<(&str, &str)> = d["changes"].as_array().unwrap().iter().map(|x| (x["path"].as_str().unwrap(), x["kind"].as_str().unwrap())).collect();
+        assert!(kinds.contains(&("/indicators/0/params/period", "parameter")), "{kinds:?}");
+        assert!(kinds.contains(&("/stop_loss/value", "configuration")));
+        // rollback publishes v3 with v1's logic; v1 and v2 are untouched
+        let rb = rollback(&c, v1).unwrap();
+        assert_eq!(rb["version"], 3);
+        let logic = diff(&c, v1, rb["version_id"].as_i64().unwrap()).unwrap();
+        assert!(logic["changes"].as_array().unwrap().iter().all(|x| x["path"] == "/notes"), "only the note differs: {logic}");
+        assert!(tag(&c, v2, "production-approved").unwrap_err().contains("approved live deployment"));
+        assert_eq!(tag(&c, v2, "validated").unwrap()["tags"], json!(["validated"]));
+        assert!(tag(&c, v2, "shiny").is_err());
+        // a trade made by a bot keeps the bot's version
+        let id = crate::bots::create(&mut c, &json!({ "name": "t", "symbol": "BTCUSDT", "interval": "1h", "spec": spec(), "allocation": "1000" })).unwrap();
+        let bot = crate::bots::load(&c, id).unwrap();
+        let r = crate::orders::BotRef { id, name: "t", account_id: "demo-1", market: "crypto", capital: rust_decimal::Decimal::from(1000), max_daily_loss: None, max_open_positions: 5 };
+        let req = crate::botengine::OpenReq { leg: 0, side: crate::strategy::Side::Long, qty: 1.0, price: 100.0, time: 1, stop: None, target: None, trail: None, tag: "signal".into() };
+        let pos = crate::orders::open(&mut c, &r, "BTCUSDT", &req, &crate::risk::Gate::default()).unwrap();
+        crate::orders::close(&mut c, &r, pos, 110.0, 2, "exit").unwrap();
+        let tv: Option<i64> = c.query_row("SELECT strategy_version_id FROM trades WHERE bot_id = ?1", [id], |r| r.get(0)).unwrap();
+        let bv: Option<i64> = c.query_row("SELECT strategy_version_id FROM bots WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(tv, bv);
+        assert_eq!(detail(&c, bv.unwrap()).unwrap()["trades"], 1);
+        // concurrent edit: a stale revision is refused
+        crate::bots::update(&mut c, id, &json!({ "name": "first", "revision": 0 })).unwrap();
+        assert!(matches!(crate::bots::update(&mut c, id, &json!({ "name": "second", "revision": 0 })), Err(crate::bots::BotError::Conflict(_))));
+        let _ = bot;
     }
 
     #[test]

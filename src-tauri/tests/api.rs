@@ -338,6 +338,26 @@ const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/api/system/health", "/api/system/health", None),
     ("GET", "/api/ai/status", "/api/ai/status", None),
     ("GET", "/api/scanner", "/api/scanner", None),
+    ("GET", "/api/monitor", "/api/monitor", None),
+    ("PUT", "/api/monitor/thresholds", "/api/monitor/thresholds", Some(r#"{}"#)),
+    ("GET", "/api/events", "/api/events", None),
+    ("GET", "/api/notifications", "/api/notifications", None),
+    ("POST", "/api/notifications/read", "/api/notifications/read", Some(r#"{}"#)),
+    ("GET", "/api/risk/portfolio", "/api/risk/portfolio", None),
+    ("PUT", "/api/risk/portfolio", "/api/risk/portfolio", Some(r#"{}"#)),
+    ("PUT", "/api/risk/limits/{account}/extra", "/api/risk/limits/demo-1/extra", Some(r#"{}"#)),
+    ("GET", "/api/attribution", "/api/attribution", None),
+    ("GET", "/api/attribution/trades/{id}", "/api/attribution/trades/999999", None),
+    ("GET", "/api/drift/{id}", "/api/drift/999999", None),
+    ("PUT", "/api/drift/config", "/api/drift/config", Some(r#"{}"#)),
+    ("POST", "/api/drift/{id}/autopause", "/api/drift/999999/autopause", Some(r#"{}"#)),
+    ("GET", "/api/strategy-versions/{id}", "/api/strategy-versions/999999", None),
+    ("GET", "/api/strategy-versions/{id}/diff/{other}", "/api/strategy-versions/999999/diff/999998", None),
+    ("POST", "/api/strategy-versions/{id}/tags", "/api/strategy-versions/999999/tags", Some(r#"{}"#)),
+    ("POST", "/api/strategy-versions/{id}/rollback", "/api/strategy-versions/999999/rollback", Some(r#"{}"#)),
+    ("GET", "/api/jobs", "/api/jobs", None),
+    ("GET", "/api/jobs/{id}", "/api/jobs/999999", None),
+    ("POST", "/api/jobs/{id}/cancel", "/api/jobs/999999/cancel", Some(r#"{}"#)),
     ("GET", "/api/dev/tokens", "/api/dev/tokens", None),
     ("POST", "/api/dev/tokens", "/api/dev/tokens", Some(r#"{"name":"x","scopes":["read"]}"#)),
     ("DELETE", "/api/dev/tokens/{id}", "/api/dev/tokens/999999", None),
@@ -1203,4 +1223,48 @@ async fn developer_tokens_are_scoped_and_cannot_reach_safety_controls() {
     let id = t["id"].as_i64().unwrap();
     assert_eq!(send(&r, "DELETE", &format!("/api/dev/tokens/{id}"), None).await.0, StatusCode::OK);
     assert_eq!(dev("GET", "/api/bots", None).await, StatusCode::UNAUTHORIZED, "revoked");
+}
+
+/// Phase 9 over HTTP: monitor, portfolio risk with a breach that becomes an event, attribution, version control.
+#[tokio::test]
+async fn phase9_operations_over_http() {
+    let r = router();
+    let (s, m) = get_json(&r, "/api/monitor").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(m["components"].as_array().unwrap().iter().any(|c| c["id"] == "runner"));
+    let m2 = get_json(&r, "/api/monitor").await.1;
+    assert!(m2["metrics"]["requests"].as_u64().unwrap() > m["metrics"]["requests"].as_u64().unwrap(), "earlier requests are measured");
+    // a portfolio limit that the next order breaches: refused, recorded as an event and a notification
+    assert_eq!(send(&r, "PUT", "/api/risk/portfolio", Some(json!({ "USDT": { "max_exposure": "100" } }))).await.0, StatusCode::OK);
+    let (s, e) = send(&r, "POST", "/api/positions", Some(json!({"market":"crypto","mode":"demo","symbol":"BTCUSDT","side":"long","qty":0.01,"price":78000}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().contains("portfolio exposure"));
+    let (_, ev) = get_json(&r, "/api/events?type=RiskLimitBreached").await;
+    assert_eq!(ev["events"].as_array().unwrap().len(), 1);
+    assert_eq!(get_json(&r, "/api/notifications").await.1["unread"], 1);
+    let (_, risk) = get_json(&r, "/api/risk/portfolio").await;
+    assert_eq!(risk["breaches_24h"], 1);
+    // attribution reconciles (no trades yet is still a valid, reconciled answer)
+    let (s, a) = get_json(&r, "/api/attribution?dimension=symbol").await;
+    assert_eq!((s, a["reconciled"].clone()), (StatusCode::OK, json!(true)));
+    assert_eq!(get_json(&r, "/api/attribution?dimension=nope").await.0, StatusCode::BAD_REQUEST);
+    // version control: a bot edit publishes v2; diff and rollback
+    let lib = get_json(&r, "/api/strategies/library").await.1;
+    let spec = lib["templates"].as_array().unwrap().iter().find(|t| t["id"] == "rsi").unwrap()["spec"].clone();
+    let (_, bot) = send(&r, "POST", "/api/bots", Some(json!({ "name": "V", "symbol": "BTCUSDT", "spec": spec, "allocation": "100" }))).await;
+    let v1 = bot["strategy_version"]["id"].as_i64().unwrap();
+    let mut s2 = spec.clone();
+    s2["indicators"][0]["params"]["period"] = json!(9);
+    let (_, bot2) = send(&r, "PUT", &format!("/api/bots/{}", bot["id"]), Some(json!({ "spec": s2, "revision": bot["revision"] }))).await;
+    let v2 = bot2["strategy_version"]["id"].as_i64().unwrap();
+    assert_ne!(v1, v2);
+    let (_, d) = get_json(&r, &format!("/api/strategy-versions/{v1}/diff/{v2}")).await;
+    assert_eq!(d["changes"][0]["kind"], "parameter");
+    let (s, rb) = send(&r, "POST", &format!("/api/strategy-versions/{v1}/rollback"), None).await;
+    assert_eq!(s, StatusCode::OK, "{rb}");
+    assert_eq!(rb["version"], 3);
+    // a stale revision is refused
+    let (s, _) = send(&r, "PUT", &format!("/api/bots/{}", bot["id"]), Some(json!({ "name": "late", "revision": 0 }))).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(get_json(&r, &format!("/api/drift/{}", bot["id"])).await.1["status"], "insufficient_data");
 }

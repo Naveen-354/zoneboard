@@ -79,8 +79,8 @@ fn record_fill(conn: &mut Connection, ctx: &BotCtx, cid: &str, rep: &OrderReport
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     if action == "open" {
         tx.execute(
-            "INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id, bot_id, leg, stop, target, trail, trail_ref, tag, bar_time)
-             VALUES ('crypto','live',?1,'long',?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13)",
+            "INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id, bot_id, leg, stop, target, trail, trail_ref, tag, bar_time, strategy_version_id)
+             VALUES ('crypto','live',?1,'long',?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13,(SELECT strategy_version_id FROM bots WHERE id = ?7))",
             params![ctx.symbol, qty, px, crate::journal::fee_pct("crypto"), chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), ctx.account_id, ctx.bot_id, stop, target, trail, trail.as_ref().map(|_| px), tag, bar],
         )
         .map_err(|e| e.to_string())?;
@@ -102,15 +102,15 @@ fn record_fill(conn: &mut Connection, ctx: &BotCtx, cid: &str, rep: &OrderReport
 
 /// Write the outbox row for one intent. `Ok(None)` when this exact intent was already submitted.
 fn outbox(conn: &mut Connection, ctx: &BotCtx, cid: &str, intent: &Intent, qty: &str) -> Result<Option<()>, String> {
-    let (action, side, pos, bar, tag, stop, target, trail) = match intent {
-        Intent::Open { bar_time, stop, target, trail, tag, .. } => ("open", "BUY", None, *bar_time, tag.clone(), *stop, *target, trail.map(|d| serde_json::to_string(&d).unwrap_or_default())),
-        Intent::Close { position_id, bar_time, reason } => ("close", "SELL", Some(*position_id), *bar_time, reason.clone(), None, None, None),
+    let (action, side, pos, bar, tag, stop, target, trail, ref_price) = match intent {
+        Intent::Open { bar_time, stop, target, trail, tag, ref_price, .. } => ("open", "BUY", None, *bar_time, tag.clone(), *stop, *target, trail.map(|d| serde_json::to_string(&d).unwrap_or_default()), Some(*ref_price)),
+        Intent::Close { position_id, bar_time, reason } => ("close", "SELL", Some(*position_id), *bar_time, reason.clone(), None, None, None, None),
     };
     let n = conn
         .execute(
-            "INSERT OR IGNORE INTO broker_orders (bot_id, account_id, client_order_id, symbol, side, action, qty, position_id, bar_time, tag, stop, target, trail, status, created_utc, updated_utc)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'submitting',?14,?14)",
-            params![ctx.bot_id, ctx.account_id, cid, ctx.symbol, side, action, qty, pos, bar, tag, stop, target, trail, now()],
+            "INSERT OR IGNORE INTO broker_orders (bot_id, account_id, client_order_id, symbol, side, action, qty, position_id, bar_time, tag, stop, target, trail, status, created_utc, updated_utc, ref_price)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'submitting',?14,?14,?15)",
+            params![ctx.bot_id, ctx.account_id, cid, ctx.symbol, side, action, qty, pos, bar, tag, stop, target, trail, now(), ref_price],
         )
         .map_err(|e| e.to_string())?;
     Ok((n == 1).then_some(()))
@@ -126,6 +126,7 @@ fn reject(conn: &Connection, ctx: &BotCtx, intent: &Intent, reason: &str) {
         params![ctx.bot_id, now(), bar, ctx.symbol, action, qty, px, reason],
     );
     crate::bots::log(conn, ctx.bot_id, "warn", &format!("broker order refused: {reason}"));
+    crate::riskintel::on_rejection(conn, &format!("bot {}", ctx.bot_id), &ctx.account_id, &ctx.symbol, reason);
 }
 
 /// Execute the intents of one runner step. `with_conn` gives synchronous access to the database between

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 /// The latest schema version supported by this application.
-pub const CURRENT_VERSION: u32 = 8;
+pub const CURRENT_VERSION: u32 = 9;
 
 /// Database error type covering schema version mismatches, SQLite errors, and IO issues.
 #[derive(Debug)]
@@ -497,6 +497,121 @@ pub fn migrate(conn: &mut Connection) -> Result<(), DbError> {
             );
             CREATE INDEX idx_broker_orders_status ON broker_orders(status);
             PRAGMA user_version = 8;",
+        )?;
+        tx.commit()?;
+        ver = 8;
+    }
+
+    if ver < 9 {
+        let tx = conn.transaction()?;
+        // Migration 9 (phases 9 to 12): event log, incidents, notifications, jobs, extra risk limits, version tags
+        // and trade-to-version links, drift, regimes, robustness, research runs, news and calendar, workflows,
+        // parent/child orders, ledger. Additive only.
+        tx.execute_batch(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts_utc TEXT NOT NULL, type TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+                correlation_id TEXT, idem_key TEXT UNIQUE, subject TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX idx_events_type ON events(type, id);
+            CREATE TABLE incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe_key TEXT NOT NULL, component TEXT NOT NULL,
+                severity TEXT NOT NULL CHECK (severity IN ('warning','degraded','unavailable')), title TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '', first_utc TEXT NOT NULL, last_utc TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')), resolved_utc TEXT
+            );
+            CREATE UNIQUE INDEX idx_incidents_open ON incidents(dedupe_key) WHERE status = 'open';
+            CREATE TABLE notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts_utc TEXT NOT NULL, source TEXT NOT NULL, title TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '', dedupe_key TEXT UNIQUE, count INTEGER NOT NULL DEFAULT 1, read INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','cancelled')),
+                request TEXT NOT NULL, result TEXT, error TEXT, progress REAL NOT NULL DEFAULT 0, cancel_requested INTEGER NOT NULL DEFAULT 0,
+                created_utc TEXT NOT NULL, started_utc TEXT, finished_utc TEXT
+            );
+            CREATE TABLE portfolio_limits (
+                currency TEXT PRIMARY KEY CHECK (currency IN ('USDT','INR')), max_exposure TEXT, max_daily_loss TEXT, max_drawdown_pct TEXT
+            );
+            ALTER TABLE account_limits ADD COLUMN max_position_notional TEXT;
+            ALTER TABLE account_limits ADD COLUMN max_open_positions INTEGER;
+            ALTER TABLE account_limits ADD COLUMN denied_symbols TEXT;
+            ALTER TABLE trades ADD COLUMN strategy_version_id INTEGER;
+            ALTER TABLE positions ADD COLUMN strategy_version_id INTEGER;
+            ALTER TABLE bots ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+            CREATE TABLE strategy_tags (
+                version_id INTEGER NOT NULL REFERENCES strategy_versions(id), tag TEXT NOT NULL, created_utc TEXT NOT NULL,
+                PRIMARY KEY (version_id, tag)
+            );
+            CREATE TABLE drift_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id INTEGER NOT NULL, created_utc TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL
+            );
+            CREATE TABLE regime_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, market TEXT NOT NULL, symbol TEXT NOT NULL, interval TEXT NOT NULL, bar_time INTEGER NOT NULL,
+                regime TEXT NOT NULL, confidence REAL NOT NULL, features TEXT NOT NULL, rule_version TEXT NOT NULL, created_utc TEXT NOT NULL,
+                UNIQUE (market, symbol, interval, bar_time, rule_version)
+            );
+            CREATE TABLE robustness (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, backtest_id INTEGER, bot_id INTEGER, score_version TEXT NOT NULL, score REAL,
+                components TEXT NOT NULL, created_utc TEXT NOT NULL
+            );
+            CREATE TABLE research_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, created_utc TEXT NOT NULL, request TEXT NOT NULL, report TEXT,
+                candidate TEXT, review_status TEXT NOT NULL DEFAULT 'pending' CHECK (review_status IN ('pending','approved','rejected','no_candidate')),
+                reviewed_by TEXT, reviewed_utc TEXT, bot_id INTEGER
+            );
+            CREATE TABLE news_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, external_id TEXT NOT NULL, url TEXT, title TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '', publisher TEXT NOT NULL DEFAULT '', published_utc TEXT NOT NULL, retrieved_utc TEXT NOT NULL,
+                symbols TEXT NOT NULL DEFAULT '', cluster_key TEXT NOT NULL, sentiment REAL, confidence REAL, model TEXT,
+                UNIQUE (provider, external_id)
+            );
+            CREATE TABLE econ_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, external_id TEXT NOT NULL, name TEXT NOT NULL, region TEXT NOT NULL,
+                scheduled_utc TEXT NOT NULL, importance TEXT NOT NULL, prior TEXT, forecast TEXT, actual TEXT,
+                status TEXT NOT NULL CHECK (status IN ('scheduled','revised','delayed','released','cancelled')), revised_utc TEXT, retrieved_utc TEXT NOT NULL,
+                UNIQUE (provider, external_id)
+            );
+            CREATE TABLE workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','validated','enabled','disabled','archived')),
+                version INTEGER NOT NULL DEFAULT 0, created_utc TEXT NOT NULL, updated_utc TEXT NOT NULL
+            );
+            CREATE TABLE workflow_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id INTEGER NOT NULL, version INTEGER NOT NULL, graph TEXT NOT NULL, created_utc TEXT NOT NULL,
+                UNIQUE (workflow_id, version)
+            );
+            CREATE TABLE workflow_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, workflow_id INTEGER NOT NULL, version INTEGER NOT NULL, trigger_event_id INTEGER, dry_run INTEGER NOT NULL,
+                status TEXT NOT NULL, steps TEXT NOT NULL, error TEXT, created_utc TEXT NOT NULL,
+                UNIQUE (workflow_id, trigger_event_id, dry_run)
+            );
+            CREATE TABLE parent_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, market TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
+                total_qty REAL NOT NULL, algo TEXT NOT NULL, params TEXT NOT NULL, status TEXT NOT NULL, arrival_price REAL,
+                filled_qty REAL NOT NULL DEFAULT 0, avg_price REAL, created_utc TEXT NOT NULL, finished_utc TEXT, note TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE child_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER NOT NULL, seq INTEGER NOT NULL, due_utc TEXT NOT NULL, qty REAL NOT NULL,
+                status TEXT NOT NULL, price REAL, position_id INTEGER, reason TEXT NOT NULL DEFAULT '', done_utc TEXT,
+                UNIQUE (parent_id, seq)
+            );
+            CREATE TABLE ledger_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts_utc TEXT NOT NULL, account_id TEXT NOT NULL, kind TEXT NOT NULL, currency TEXT NOT NULL,
+                amount TEXT NOT NULL, ref_type TEXT NOT NULL, ref_id TEXT NOT NULL, reverses_id INTEGER, memo TEXT NOT NULL DEFAULT '', created_utc TEXT NOT NULL,
+                UNIQUE (ref_type, ref_id, kind)
+            );
+            CREATE TRIGGER ledger_immutable_update BEFORE UPDATE ON ledger_entries
+              BEGIN SELECT RAISE(ABORT, 'ledger entries are immutable: add a reversal'); END;
+            CREATE TRIGGER ledger_immutable_delete BEFORE DELETE ON ledger_entries
+              BEGIN SELECT RAISE(ABORT, 'ledger entries are immutable: add a reversal'); END;
+            ALTER TABLE broker_orders ADD COLUMN ref_price REAL;
+            CREATE TABLE kv_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_utc TEXT NOT NULL);
+            CREATE TABLE ledger_imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, created_utc TEXT NOT NULL, rows INTEGER NOT NULL,
+                matched INTEGER NOT NULL, unmatched INTEGER NOT NULL, report TEXT NOT NULL
+            );
+            PRAGMA user_version = 9;",
         )?;
         tx.commit()?;
     }

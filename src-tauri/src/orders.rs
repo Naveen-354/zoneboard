@@ -61,8 +61,8 @@ pub fn open(conn: &mut Connection, bot: &BotRef, symbol: &str, req: &OpenReq, ga
         risk::check(&tx, &order, gate)?;
         let trail = req.trail.map(|d| serde_json::to_string(&d).unwrap_or_default());
         tx.execute(
-            "INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id, bot_id, leg, stop, target, trail, trail_ref, tag, bar_time)
-             VALUES (?1,'demo',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            "INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id, bot_id, leg, stop, target, trail, trail_ref, tag, bar_time, strategy_version_id)
+             VALUES (?1,'demo',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,(SELECT strategy_version_id FROM bots WHERE id = ?9))",
             params![
                 bot.market, symbol, req.side.as_str(), req.qty, req.price, crate::journal::fee_pct(bot.market),
                 chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(), bot.account_id, bot.id, req.leg,
@@ -77,6 +77,9 @@ pub fn open(conn: &mut Connection, bot: &BotRef, symbol: &str, req: &OpenReq, ga
     })();
     if let Err(reason) = &result {
         let _ = record(conn, bot.id, req.time, symbol, req.side.as_str(), "open", req.qty, req.price, "rejected", reason, None, None);
+        crate::riskintel::on_rejection(conn, &format!("bot {}", bot.id), bot.account_id, symbol, reason);
+    } else {
+        crate::events::emit(conn, "OrderFilled", &format!("bot:{}", bot.id), serde_json::json!({ "symbol": symbol, "side": req.side.as_str(), "qty": req.qty, "price": req.price, "paper": true }), Some(&format!("bot:{}:{}", bot.id, req.time)), None);
     }
     result
 }

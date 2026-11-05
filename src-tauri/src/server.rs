@@ -24,6 +24,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 use crate::botapi;
+use crate::opsapi;
 use crate::data::{self, DataStore};
 use crate::journal::{self, Journal};
 use crate::zones::{self, Label, Summary};
@@ -90,6 +91,8 @@ pub struct AppState {
     pub(crate) conn_cache: crate::connections::Cache,
     pub(crate) ai: crate::ai::AiState,
     pub(crate) dev_limiter: crate::devtokens::Limiter,
+    pub(crate) metrics: crate::monitor::Metrics,
+    pub(crate) cancels: crate::jobs::Cancels,
 }
 
 pub type Shared = Arc<AppState>;
@@ -114,7 +117,10 @@ impl AppState {
                 }),
             )
         }).map_err(|e| format!("can't record app_start audit entry: {e}"))?;
-        journal.with_conn(|conn| crate::bots::pause_all_on_start(conn));
+        journal.with_conn(|conn| {
+            crate::bots::pause_all_on_start(conn);
+            crate::jobs::fail_interrupted(conn);
+        });
         let api_token = generate_api_token();
         Ok(Arc::new(Self {
             data: DataStore::new(sample),
@@ -127,6 +133,8 @@ impl AppState {
             conn_cache: crate::connections::Cache::default(),
             ai: crate::ai::AiState::default(),
             dev_limiter: crate::devtokens::Limiter::default(),
+            metrics: crate::monitor::Metrics::default(),
+            cancels: crate::jobs::Cancels::default(),
         }))
     }
 
@@ -201,6 +209,25 @@ pub fn app(state: Shared) -> Router {
         .route("/api/approvals/{id}/decide", post(botapi::approval_decide))
         .route("/api/approvals/{id}/revoke", post(botapi::approval_revoke))
         .route("/api/system/health", get(botapi::system_health))
+        .route("/api/monitor", get(opsapi::monitor))
+        .route("/api/monitor/thresholds", put(opsapi::monitor_thresholds))
+        .route("/api/events", get(opsapi::events))
+        .route("/api/notifications", get(opsapi::notifications))
+        .route("/api/notifications/read", post(opsapi::notifications_read))
+        .route("/api/risk/portfolio", get(opsapi::portfolio_risk).put(opsapi::portfolio_risk_put))
+        .route("/api/risk/limits/{account}/extra", put(opsapi::extra_limits_put))
+        .route("/api/attribution", get(opsapi::attribution))
+        .route("/api/attribution/trades/{id}", get(opsapi::attribution_trade))
+        .route("/api/drift/{id}", get(opsapi::drift))
+        .route("/api/drift/config", put(opsapi::drift_config))
+        .route("/api/drift/{id}/autopause", post(opsapi::drift_autopause))
+        .route("/api/strategy-versions/{id}", get(opsapi::version_detail))
+        .route("/api/strategy-versions/{id}/diff/{other}", get(opsapi::version_diff))
+        .route("/api/strategy-versions/{id}/tags", post(opsapi::version_tag))
+        .route("/api/strategy-versions/{id}/rollback", post(opsapi::version_rollback))
+        .route("/api/jobs", get(opsapi::jobs))
+        .route("/api/jobs/{id}", get(opsapi::job))
+        .route("/api/jobs/{id}/cancel", post(opsapi::job_cancel))
         .route("/api/scanner", get(botapi::scanner_catalog))
         .route("/api/dev/tokens", get(botapi::dev_tokens).post(botapi::dev_token_create))
         .route("/api/dev/tokens/{id}", delete(botapi::dev_token_revoke))
@@ -285,7 +312,12 @@ async fn guard(State(state): State<Shared>, req: Request, next: Next) -> Respons
         }
     }
 
+    let is_api = path == "/api" || path.starts_with("/api/");
+    let started = std::time::Instant::now();
     let mut resp = next.run(req).await;
+    if is_api {
+        state.metrics.record(started.elapsed().as_millis() as u64, resp.status().as_u16());
+    }
     let is_html = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("text/html"));
     let h = resp.headers_mut();
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
@@ -490,7 +522,14 @@ async fn positions_get(State(s): State<Shared>, Query(q): Query<HashMap<String, 
 
 async fn positions_open(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     // the same pre-trade checks bots get: kill switch and the account's risk limits
-    match s.journal.open_position_checked(&json_body(&headers, &body), |c, o| crate::risk::check(c, o, &s.gate)) {
+    let b = json_body(&headers, &body);
+    let r = s.journal.open_position_checked(&b, |c, o| crate::risk::check(c, o, &s.gate));
+    if let Err(e) = &r {
+        let acct = b.get("account_id").and_then(Value::as_str).unwrap_or(crate::accounts::DEFAULT_ACCOUNT).to_string();
+        let sym = b.get("symbol").and_then(Value::as_str).unwrap_or("").to_uppercase();
+        s.journal.with_conn(|c| crate::riskintel::on_rejection(c, "manual", &acct, &sym, e));
+    }
+    match r {
         Ok(p) => (StatusCode::CREATED, Json(json!({ "ok": true, "position": p }))).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, &e),
     }

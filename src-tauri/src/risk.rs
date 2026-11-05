@@ -167,11 +167,13 @@ pub fn check_broker(conn: &Connection, o: &Order, gate: &Gate, live_approved: bo
         }
         _ => return Err("unknown account environment".into()),
     }
+    crate::riskintel::broker_data_reliable(conn, &o.account_id)?;
     check_limits(conn, o)
 }
 
 /// Account and bot limits, shared by the paper and broker paths.
 fn check_limits(conn: &Connection, o: &Order) -> Result<(), String> {
+    crate::riskintel::extra_checks(conn, o)?;
     let currency = accounts::currency_for(&o.market, &o.symbol)?;
     let need = accounts::notional(o.qty, o.price).ok_or("order size is too large")?;
     let (max_order, max_loss, max_exp) = limits(conn, &o.account_id, currency)?;
