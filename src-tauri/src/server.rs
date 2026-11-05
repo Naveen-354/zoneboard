@@ -24,6 +24,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 use crate::botapi;
+use crate::intelapi;
 use crate::opsapi;
 use crate::data::{self, DataStore};
 use crate::journal::{self, Journal};
@@ -234,6 +235,20 @@ pub fn app(state: Shared) -> Router {
         .route("/api/research/experiments", post(opsapi::experiment))
         .route("/api/regimes/classify", post(opsapi::regimes_classify))
         .route("/api/regimes/history", get(opsapi::regimes_history))
+        .route("/api/research/runs", post(intelapi::research_start).get(intelapi::research_runs))
+        .route("/api/research/runs/{id}/review", post(intelapi::research_review))
+        .route("/api/explain/trades/{id}", get(intelapi::explain_trade))
+        .route("/api/explain/trades/{id}/ai", post(intelapi::explain_trade_ai))
+        .route("/api/news", get(intelapi::news))
+        .route("/api/news/import", post(intelapi::news_import))
+        .route("/api/news/sample", post(intelapi::news_sample))
+        .route("/api/econ/events", get(intelapi::econ_events))
+        .route("/api/econ/import", post(intelapi::econ_import))
+        .route("/api/econ/blackout", put(intelapi::econ_blackout))
+        .route("/api/workflows", get(intelapi::workflows).post(intelapi::workflow_create))
+        .route("/api/workflows/{id}", get(intelapi::workflow_get).put(intelapi::workflow_save))
+        .route("/api/workflows/{id}/status", post(intelapi::workflow_status))
+        .route("/api/workflows/{id}/dryrun", post(intelapi::workflow_dry_run))
         .route("/api/scanner", get(botapi::scanner_catalog))
         .route("/api/dev/tokens", get(botapi::dev_tokens).post(botapi::dev_token_create))
         .route("/api/dev/tokens/{id}", delete(botapi::dev_token_revoke))

@@ -10,12 +10,12 @@ use serde_json::{json, Value};
 
 pub const VERSION: i64 = 1;
 
-pub const TYPES: [&str; 22] = [
+pub const TYPES: [&str; 23] = [
     "MarketDataUpdated", "MarketRegimeChanged", "StrategyVersionCreated", "BacktestCompleted", "WalkForwardCompleted",
     "RiskLimitBreached", "PortfolioExposureChanged", "OrderProposed", "OrderRiskApproved", "OrderRiskRejected",
     "OrderSubmitted", "OrderPartiallyFilled", "OrderFilled", "OrderRejected", "BotStateChanged", "StrategyDriftDetected",
     "BrokerConnectionChanged", "DataFeedStale", "EconomicEventApproaching", "NewsSentimentChanged", "WorkflowTriggered",
-    "WorkflowActionCompleted",
+    "WorkflowActionCompleted", "ResearchRunCompleted",
 ];
 
 fn now() -> String {

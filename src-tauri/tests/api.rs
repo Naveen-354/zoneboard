@@ -338,6 +338,23 @@ const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/api/system/health", "/api/system/health", None),
     ("GET", "/api/ai/status", "/api/ai/status", None),
     ("GET", "/api/scanner", "/api/scanner", None),
+    ("POST", "/api/research/runs", "/api/research/runs", Some(r#"{}"#)),
+    ("GET", "/api/research/runs", "/api/research/runs", None),
+    ("POST", "/api/research/runs/{id}/review", "/api/research/runs/999999/review", Some(r#"{}"#)),
+    ("GET", "/api/explain/trades/{id}", "/api/explain/trades/999999", None),
+    ("POST", "/api/explain/trades/{id}/ai", "/api/explain/trades/999999/ai", Some(r#"{}"#)),
+    ("GET", "/api/news", "/api/news", None),
+    ("POST", "/api/news/import", "/api/news/import", Some(r#"{}"#)),
+    ("POST", "/api/news/sample", "/api/news/sample", Some(r#"{}"#)),
+    ("GET", "/api/econ/events", "/api/econ/events", None),
+    ("POST", "/api/econ/import", "/api/econ/import", Some(r#"{}"#)),
+    ("PUT", "/api/econ/blackout", "/api/econ/blackout", Some(r#"{}"#)),
+    ("GET", "/api/workflows", "/api/workflows", None),
+    ("POST", "/api/workflows", "/api/workflows", Some(r#"{}"#)),
+    ("GET", "/api/workflows/{id}", "/api/workflows/999999", None),
+    ("PUT", "/api/workflows/{id}", "/api/workflows/999999", Some(r#"{}"#)),
+    ("POST", "/api/workflows/{id}/status", "/api/workflows/999999/status", Some(r#"{}"#)),
+    ("POST", "/api/workflows/{id}/dryrun", "/api/workflows/999999/dryrun", Some(r#"{}"#)),
     ("POST", "/api/research/montecarlo", "/api/research/montecarlo", Some(r#"{}"#)),
     ("POST", "/api/research/walkforward", "/api/research/walkforward", Some(r#"{}"#)),
     ("POST", "/api/research/robustness", "/api/research/robustness", Some(r#"{}"#)),
@@ -1321,4 +1338,72 @@ async fn phase10_research_jobs_over_http() {
     assert!(!get_json(&r, "/api/regimes/history?symbol=BTCUSDT&interval=1h").await.1["observations"].as_array().unwrap().is_empty());
     // research never touched an account
     assert_eq!(get_json(&r, "/api/positions?market=crypto&mode=demo").await.1["positions"].as_array().unwrap().len(), 0);
+}
+
+/// Phase 11 over HTTP: research run and human review, trade fact sheet, news, calendar blackout through the
+/// central risk check, workflows (validation, dry run, no order nodes).
+#[tokio::test(flavor = "multi_thread")]
+async fn phase11_intelligence_over_http() {
+    let r = router();
+    // research: bounded job, then a person reviews; approval publishes a version and creates no bot
+    let (s, j) = send(&r, "POST", "/api/research/runs", Some(json!({ "symbol": "BTCUSDT", "interval": "1h", "bars": 1200, "templates": ["ema_cross", "ma_cross"] }))).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{j}");
+    let job = wait_job(&r, j["job_id"].as_i64().unwrap()).await;
+    assert_eq!(job["status"], "done", "{job}");
+    let run_id = job["result"]["run_id"].as_i64().unwrap();
+    let runs = get_json(&r, "/api/research/runs").await.1;
+    assert_eq!(runs["runs"][0]["id"], run_id);
+    let review = send(&r, "POST", &format!("/api/research/runs/{run_id}/review"), Some(json!({ "decision": "approve" }))).await;
+    if job["result"]["review_status"] == "pending" {
+        assert_eq!(review.0, StatusCode::OK, "{}", review.1);
+        assert!(review.1["strategy_version_id"].is_i64());
+        assert_eq!(send(&r, "POST", &format!("/api/research/runs/{run_id}/review"), Some(json!({ "decision": "approve" }))).await.0, StatusCode::BAD_REQUEST, "reviewed once");
+    } else {
+        assert_eq!(review.0, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(get_json(&r, "/api/bots").await.1["bots"].as_array().unwrap().len(), 0, "research never creates bots");
+
+    // a closed paper trade gets a sourced fact sheet; news around it is cited
+    let (_, _, b) = call(&r, "POST", "/api/positions", "localhost", Some(order(json!({}))), &[]).await;
+    let pid = serde_json::from_slice::<Value>(&b).unwrap()["position"]["id"].as_i64().unwrap();
+    let (_, _, b) = call(&r, "POST", &format!("/api/positions/{pid}/close"), "localhost", Some(json!({"price": 79000, "date": "2026-11-02"})), &[]).await;
+    let tid = serde_json::from_slice::<Value>(&b).unwrap()["trade"]["id"].as_i64().unwrap();
+    let (s, imp) = send(&r, "POST", "/api/news/import", Some(json!({ "items": [{ "id": "a1", "title": "BTC rallies on record inflows", "published_utc": "2026-11-02T09:00:00Z", "symbols": ["BTCUSDT"], "publisher": "Owner import" }] }))).await;
+    assert_eq!((s, imp["added"].as_i64()), (StatusCode::OK, Some(1)), "{imp}");
+    let (s, f) = get_json(&r, &format!("/api/explain/trades/{tid}")).await;
+    assert_eq!(s, StatusCode::OK, "{f}");
+    assert!(f["facts"].to_string().contains("BTC rallies"));
+    assert!(f["facts"].as_array().unwrap().iter().all(|x| x["source"].is_string()));
+    // no AI key configured: the interpretation is refused, the facts remain available
+    assert_eq!(send(&r, "POST", &format!("/api/explain/trades/{tid}/ai"), Some(json!({}))).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(send(&r, "POST", "/api/news/sample", Some(json!({}))).await.0, StatusCode::OK, "the test server runs on sample data");
+    let n = get_json(&r, "/api/news?symbol=BTCUSDT").await.1;
+    assert!(n["items"].as_array().unwrap().iter().any(|x| x["label"] == "SAMPLE (made up)"));
+
+    // calendar blackout refuses new entries through the central risk check
+    let soon = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (s, e) = send(&r, "POST", "/api/econ/import", Some(json!({ "csv": format!("id,name,region,scheduled_utc,importance\nfomc,FOMC decision,US,{soon},high\n") }))).await;
+    assert_eq!((s, e["added"].as_i64()), (StatusCode::OK, Some(1)), "{e}");
+    assert_eq!(send(&r, "PUT", "/api/econ/blackout", Some(json!({ "enabled": true, "minutes_before": 30, "minutes_after": 30 }))).await.0, StatusCode::OK);
+    let (s, _, b) = call(&r, "POST", "/api/positions", "localhost", Some(order(json!({}))), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+    assert!(String::from_utf8_lossy(&b).contains("blackout"));
+    send(&r, "PUT", "/api/econ/blackout", Some(json!({ "enabled": false }))).await;
+    assert_eq!(call(&r, "POST", "/api/positions", "localhost", Some(order(json!({}))), &[]).await.0, StatusCode::CREATED);
+
+    // workflows: an order node is refused; a valid graph dry-runs without side effects
+    let bad = json!({ "name": "Buy the dip", "graph": { "trigger": { "event": "MarketRegimeChanged" }, "nodes": [{ "id": "o", "type": "place_order", "params": {} }], "edges": [["trigger", "o"]] } });
+    let (_, w) = send(&r, "POST", "/api/workflows", Some(bad)).await;
+    assert_eq!(w["status"], "draft");
+    assert!(w["problems"].to_string().contains("not allowed"));
+    let wid = w["id"].as_i64().unwrap();
+    assert_eq!(send(&r, "POST", &format!("/api/workflows/{wid}/status"), Some(json!({ "status": "enabled" }))).await.0, StatusCode::BAD_REQUEST);
+    let good = json!({ "name": "Regime alert", "graph": { "trigger": { "event": "MarketRegimeChanged" }, "nodes": [{ "id": "c", "type": "condition", "params": { "field": "payload.to", "op": "eq", "value": "high_volatility" } }, { "id": "n", "type": "notify", "params": { "title": "Volatility up" } }, { "id": "r", "type": "risk_assessment", "params": {} }], "edges": [["trigger", "c"], ["c", "n"], ["c", "r"]] } });
+    let (s, w) = send(&r, "PUT", &format!("/api/workflows/{wid}"), Some(good)).await;
+    assert_eq!((s, w["status"].as_str()), (StatusCode::OK, Some("validated")), "{w}");
+    assert_eq!(w["version"], 2);
+    let (_, d) = send(&r, "POST", &format!("/api/workflows/{wid}/dryrun"), Some(json!({ "event": { "type": "MarketRegimeChanged", "payload": { "to": "high_volatility" } } }))).await;
+    assert_eq!(d["steps"].as_array().unwrap().len(), 3, "{d}");
+    assert_eq!(send(&r, "POST", &format!("/api/workflows/{wid}/status"), Some(json!({ "status": "enabled" }))).await.0, StatusCode::OK);
+    assert!(get_json(&r, "/api/notifications").await.1.to_string().contains("Volatility up") == false, "dry run notified nobody");
 }

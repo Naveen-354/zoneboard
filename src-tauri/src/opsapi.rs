@@ -175,12 +175,23 @@ pub fn housekeeping(s: &Shared) {
                 let _ = crate::drift::evaluate(c, id);
             }
         }
+        crate::intel::announce(c, chrono::Utc::now());
     });
+    // workflows: research requests become bounded research jobs (fetching data is async)
+    let research = s.journal.with_conn(|c| crate::workflows::process(c));
+    for h in research {
+        let st = s.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::intelapi::start_research(&st, h, "workflow").await {
+                st.journal.with_conn(|c| crate::events::notify(c, "workflow", "Workflow research run not started", &e, None));
+            }
+        });
+    }
 }
 
 // ------------------------------------------------------------------ phase 10: quant research
 
-fn job_started(r: Result<i64, String>) -> Response {
+pub(crate) fn job_started(r: Result<i64, String>) -> Response {
     match r {
         Ok(id) => (StatusCode::ACCEPTED, Json(json!({ "job_id": id, "status_url": format!("/api/jobs/{id}") }))).into_response(),
         Err(e) if e.contains("already running") => err(StatusCode::TOO_MANY_REQUESTS, &e),
@@ -233,7 +244,7 @@ pub async fn montecarlo(State(s): State<Shared>, headers: HeaderMap, body: axum:
     }))
 }
 
-async fn bt_data(s: &Shared, b: &Value) -> Result<(crate::botapi::BtReq, std::sync::Arc<crate::zones::Frame>, usize), Response> {
+pub(crate) async fn bt_data(s: &Shared, b: &Value) -> Result<(crate::botapi::BtReq, std::sync::Arc<crate::zones::Frame>, usize), Response> {
     let r = crate::botapi::bt_request(s, b)?;
     let (fa, _) = crate::botapi::frames(s, &r).await?;
     let iv = crate::bots::interval_secs(&r.interval).unwrap_or(3600);

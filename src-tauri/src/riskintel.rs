@@ -71,6 +71,9 @@ pub fn demo_drawdown(conn: &Connection, currency: &str) -> (Decimal, Decimal, f6
 
 /// Checks run by `risk::check_limits` before the original ones.
 pub fn extra_checks(conn: &Connection, o: &Order) -> Result<(), String> {
+    if let Some(e) = crate::intel::blackout_hit(conn, &o.market, chrono::Utc::now()) {
+        return Err(format!("economic-event blackout: {e}; new entries are paused around high-importance events"));
+    }
     let currency = accounts::currency_for(&o.market, &o.symbol)?;
     let need = accounts::notional(o.qty, o.price).ok_or("order size is too large")?;
     let x = extra(conn, &o.account_id, currency);
