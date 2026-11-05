@@ -211,7 +211,9 @@ const scenarios = [
     assert(a.badge === "VIRTUAL", `account card badge: ${a.badge}`);
     assert(/10,000/.test(a.text) && /1,000,000/.test(a.text), "default virtual credits not shown");
     assert(/holds no money/.test(a.note), "the 'holds no money' line is missing");
-    assert(a.brokers.length === 2 && a.brokers.every(([t, off]) => /Not connected|NOT CONNECTED/i.test(t) && off), "broker cards must say Not connected with a disabled Connect");
+    assert(a.brokers.length === 2 && a.brokers.every(([t]) => /NOT CONNECTED|NOT BUILT/i.test(t)), "broker cards must say they are not connected");
+    assert(a.brokers[1][1] === true && /FYERS/.test(a.brokers[1][0]), "FYERS connect stays disabled until its connector exists");
+    assert(await p.eval(`document.querySelector('#bnForm [name=api_secret]').type === 'password'`), "the secret field must be a password field");
     // edit credits end to end: the server's validation message and a successful save both reach the page
     await p.eval(`document.querySelector('#acctList .acct-actions button').click()`);
     await p.eval(`(() => { const f = document.querySelector('#acctList .acct-edit'); f.elements.USDT.value = '0.123456789'; f.requestSubmit(); })()`);
@@ -228,12 +230,39 @@ const scenarios = [
     assert(p.errors.length === 0, `console errors:\n    ${p.errors.join("\n    ")}`);
   }],
 
+  ["Bot Studio: catalog, create, backtest on sample data, live refused", async (p, url) => {
+    await p.load(url);
+    await waitBooted(p);
+    await p.eval(`document.querySelector('#tabs [data-v=bots]').click()`);
+    await p.waitFor(`document.querySelectorAll('.cat-card').length === 7`, "seven catalog bots");
+    const kinds = await p.eval(`[...document.querySelectorAll('.cat-card .bdg')].map(b => b.textContent).join(',')`);
+    assert(/OPEN SOURCE/.test(kinds) && /COMMERCIAL/.test(kinds), `open source vs commercial badges: ${kinds}`);
+    assert(await p.eval(`[...document.querySelectorAll('.cat-note')].every(n => /Not integrated/.test(n.textContent))`), "every catalog card must say it is not integrated");
+    // add the first catalog bot, create it
+    await p.eval(`document.querySelector('.cat-card .btn').click()`);
+    await p.waitFor(`/not an integration/.test(document.querySelector('.st-build-head')?.textContent || '')`, "builder says the bot is not an integration");
+    await p.eval(`document.querySelector('.st-actions .btn').click()`);
+    await p.waitFor(`/Created/.test(document.querySelector('.st-actions .st-msg').textContent)`, "bot created");
+    await p.eval(`document.querySelector('#stTabs [data-t=mine]').click()`);
+    await p.waitFor(`document.querySelectorAll('.bot-card').length === 1 && /VIRTUAL/.test(document.querySelector('.bot-card').textContent)`, "bot card labelled VIRTUAL");
+    // backtest with the saved report
+    await p.eval(`[...document.querySelectorAll('.bot-card button')].find(b => b.textContent === 'Backtest').click()`);
+    await p.waitFor(`[...document.querySelectorAll('.st-actions .btn')].some(b => b.textContent === 'Run backtest')`, "backtest form");
+    await p.eval(`[...document.querySelectorAll('.st-actions .btn')].find(b => b.textContent === 'Run backtest').click()`);
+    await p.waitFor(`document.querySelector('.bt-out .stats') && /SAMPLE DATA/.test(document.querySelector('.bt-out').textContent)`, "backtest metrics labelled SAMPLE", 30000);
+    // live readiness: refused, with the reasons
+    await p.eval(`document.querySelector('#stTabs [data-t=perf]').click()`);
+    await p.waitFor(`document.querySelectorAll('.gate-list li').length >= 6`, "live-readiness checklist");
+    assert(await p.eval(`/order route built/.test(document.querySelector('.gate-list').textContent) && document.querySelector('.gate-list li.ok') !== null`), "checklist shows the saved backtest and the missing live route");
+    assert(p.errors.length === 0, `console errors:\n    ${p.errors.join("\n    ")}`);
+  }],
+
   ["mobile 375px: no horizontal scroll", async (p, url) => {
     await p.viewport(375, 812, true);
     try {
       await p.load(url);
       await waitBooted(p);
-      for (const view of ["board", "orders", "accounts", "journal", "settings"]) {
+      for (const view of ["board", "orders", "scanner", "bots", "portfolio", "accounts", "journal", "settings"]) {
         await p.eval(`document.querySelector('#tabs [data-v=${view}]').click()`);
         await sleep(300);
         const m = await p.eval(`({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth, bw: document.body.scrollWidth })`);

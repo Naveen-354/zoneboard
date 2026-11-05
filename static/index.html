@@ -39,6 +39,9 @@
   <nav class="seg" id="tabs" aria-label="Pages">
     <button type="button" data-v="board" class="on" aria-current="page">Board</button>
     <button type="button" data-v="orders">Orders</button>
+    <button type="button" data-v="scanner">Scanner</button>
+    <button type="button" data-v="bots">Bot Studio</button>
+    <button type="button" data-v="portfolio">Portfolio</button>
     <button type="button" data-v="accounts">Accounts</button>
     <button type="button" data-v="journal">Journal</button>
     <button type="button" data-v="settings">Settings</button>
@@ -154,6 +157,22 @@
   </section>
 </main>
 
+<main class="page studio" id="scannerView" hidden>
+  <div class="jhead"><div><b>Market Scanner</b><span class="jsub">Configurable scans with their formula, source and freshness</span></div></div>
+  <div class="st-body" id="scanBody"></div>
+</main>
+
+<main class="page studio" id="portfolioView" hidden>
+  <div class="jhead"><div><b>Portfolio</b><span class="jsub">Accounts, attribution, exposure and reports</span></div></div>
+  <div class="st-body" id="pfBody"></div>
+</main>
+
+<main class="page studio" id="botsView" hidden>
+  <div class="jhead"><div><b>Bot Studio</b><span class="jsub">Build, backtest and run trading bots on the demo account</span></div><span class="jsub" id="stNote" role="status"></span></div>
+  <nav class="seg st-tabs" id="stTabs" role="tablist" aria-label="Bot Studio sections"></nav>
+  <div class="st-body" id="stBody"></div>
+</main>
+
 <main class="page" id="accountsView" hidden>
   <div class="jhead"><div><b>Accounts</b><span class="jsub">Practice accounts and, later, your brokers</span></div></div>
   <p class="no-money" id="acctNote">This app holds no money. Real balances are fetched from your broker; virtual credits are practice only.</p>
@@ -165,17 +184,27 @@
   </form>
   <h2 class="page-h">Brokers</h2>
   <div class="broker-grid">
-    <article class="card acct broker">
-      <div class="acct-head"><b>Binance</b><span class="tag delay">NOT CONNECTED</span></div>
-      <p>Spot account balances and orders. Arrives with the Binance connector.</p>
-      <button class="btn ghost" type="button" disabled>Connect</button>
+    <article class="card acct broker" id="bnConnect">
+      <div class="acct-head"><b>Binance</b><span class="tag delay" id="bnState">NOT CONNECTED</span></div>
+      <p>Spot balances from your own Binance account. Use a key with <b>Reading</b> (and Spot trading only if you plan to trade), restricted to your IP. A key that can withdraw funds is refused. Start with the <b>Spot Testnet</b> and throwaway keys.</p>
+      <form class="acct-edit bn-form" id="bnForm" autocomplete="off">
+        <label>Environment<select name="environment"><option value="testnet">Spot Testnet (practice keys)</option><option value="live">Live (real account)</option></select></label>
+        <label>Name<input name="label" type="text" maxlength="60" placeholder="Binance Testnet"></label>
+        <label>API key<input name="api_key" type="password" autocomplete="off" spellcheck="false"></label>
+        <label>Secret key<input name="api_secret" type="password" autocomplete="off" spellcheck="false"></label>
+        <label class="set-check" hidden id="bnLive"><input type="checkbox" name="confirm_live"> I am connecting a real account with a read-only, IP-restricted key</label>
+        <button class="btn" type="submit">Connect</button>
+      </form>
+      <p class="acct-msg" id="bnMsg" role="status" aria-live="polite"></p>
+      <small class="jsub">The keys go straight to Windows Credential Manager. They are never stored in ZoneBoard's database, shown again, or sent to this page.</small>
     </article>
     <article class="card acct broker">
-      <div class="acct-head"><b>FYERS</b><span class="tag delay">NOT CONNECTED</span></div>
-      <p>NSE live data and orders. Arrives with the FYERS connector.</p>
+      <div class="acct-head"><b>FYERS</b><span class="tag delay">NOT BUILT YET</span></div>
+      <p>NSE live data and orders. Needs the FYERS connector (docs/fyers/SPEC.md); until then NSE data is Yahoo, about 15 min delayed.</p>
       <button class="btn ghost" type="button" disabled>Connect</button>
     </article>
   </div>
+  <div class="acct-list" id="brokerList"></div>
 </main>
 
 <main class="page" id="settingsView" hidden>
@@ -191,6 +220,19 @@
   <section class="card page-card">
     <h2 class="sec-h">Security</h2>
     <div class="sec-list" id="setSecurity"></div>
+  </section>
+  <section class="card page-card" id="devHub">
+    <h2 class="sec-h">Developer</h2>
+    <p class="st-about">Scoped API tokens for scripts and notebooks (Python SDK: <code>tools/sdk/zoneboard_client.py</code>; API description: <code>/api/openapi.json</code>). A token can never reach broker credentials, approvals, live arming, risk limits or the kill switch. Strategies are declarative JSON: no custom code runs inside ZoneBoard.</p>
+    <form class="acct-new" id="devNew" autocomplete="off">
+      <label>Token name<input name="name" type="text" maxlength="60" placeholder="My notebook"></label>
+      <label class="set-check"><input type="checkbox" name="read" checked> read</label>
+      <label class="set-check"><input type="checkbox" name="research"> research</label>
+      <label class="set-check"><input type="checkbox" name="trade"> trade (bots, paper orders)</label>
+      <button class="btn" type="submit">Create token</button>
+    </form>
+    <p class="set-msg" id="devMsg" role="status" aria-live="polite"></p>
+    <div class="table-wrap"><table><thead><tr><th>Name</th><th>Scopes</th><th>Token</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody id="devBody"></tbody></table></div>
   </section>
   <section class="card page-card">
     <div class="sec-top"><h2 class="sec-h">Audit log</h2><span class="jsub" id="auditNote"></span><button class="btn ghost" id="auditRefresh" type="button">Refresh</button></div>

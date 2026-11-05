@@ -2,10 +2,11 @@
 
 Single source of shared context for Claude, Antigravity and the owner. Claude updates it after every review. Read `ROADMAP.md` for the plan and `WORKFLOW.md` for how work is handed off.
 
-**Updated:** 2026-11-03 · **Phase:** 0 (T001 to T004 merged into `main`; Phase 0 remainder and Phase 1 next) · **Baseline commit:** `ed9c249`
+**Updated:** 2026-11-04 · **Phase:** 0/1 done except T007, T008; Bot Studio (pulled-forward Phase 2/3 work, paper only) on branch `feature/bot-studio` · **Baseline commit:** `ed9c249`
 
 ## Next
 
+0. Owner: review and decide whether to merge **Bot Studio** (branch `feature/bot-studio`, see Log 2026-11-04). Before the first run on your real `journal.db`: copy it (`copy journal.db journal.db.v4.bak`); migration 5 makes it unreadable to older builds. Then run `node tools/live_check.mjs` and start one crypto demo bot by hand: the cloud sandbox could not reach Binance or Yahoo, so a bot has not yet run on live data outside the tests.
 1. Owner: run T004's `#[ignore]` Credential Manager test once by hand. It writes and removes a throwaway entry in your Windows Credential Manager and is the only proof the vault uses the real OS store, not an in-memory stand-in. From `D:\project\zoneboard\src-tauri`: `cargo test --no-default-features -- --ignored test_os_keychain_real_store_lifecycle_and_boundaries`. Tell Claude whether it passed.
 2. Claude, next: dispatch **T009** (freeze Python) and **T010** (UI smoke harness), then **T005** (accounts, demo) which builds on T003 and T004. Plan-only first, as in Wave 2; implementation needs the owner's go-ahead and the sandbox-off decision (valid only while no real credential is on the machine; **revisit before T007**).
 3. Owner: answer decisions **D1 to D3** below (D3 decides whether FYERS can ever place orders). Not needed for T009, T010 or T005.
@@ -33,13 +34,14 @@ _Planned deletion:_ Delete the Python backend after Phase 1 if parity tests have
 | T002 API token | **done, merged** | task/T002 | merge `0f4effa` (work `b9f8843`, `2f227e8`) | browser and desktop window verified; 2 review rounds |
 | T003 audit and settings | **done, merged** | task/T003 | merge `46f6fdd` (work `b9b934e`, `251b6e5`) | 2 review rounds |
 | T004 vault | **done, merged; owner's Credential Manager run still open** | task/T004 | merge `9746baa` (work `21debb7`, `6245416`) | 2 review rounds |
-| T005 accounts, demo | **done, on branch `main-7qabub`, awaiting owner's merge approval** | main-7qabub | `d5c1dd1` | 38 mutations all CAUGHT (2 survived at first and got tests); see Log |
-| T006 nav and accounts UI | **done, on branch `main-7qabub`, awaiting owner's merge approval** | main-7qabub | see git log | 6 UI mutations CAUGHT; screenshots reviewed |
+| T005 accounts, demo | **done, merged** | main-7qabub | merge `f41de44` (work `d5c1dd1`) | 38 mutations all CAUGHT (2 survived at first and got tests); see Log |
+| T006 nav and accounts UI | **done, merged** | main-7qabub | merge `f41de44` (work `35995ff`) | 6 UI mutations CAUGHT; screenshots reviewed |
 | T007 Binance read | spec ready | | | after T001, T004, T005 |
 | T008 security review | spec ready | | | after T002, T004, T007 |
 | T009 freeze Python | **done, merged** | task/T009 | PR #1 (`c637f96`) | docs and comments only |
 | T010 UI smoke harness | **done, merged** | task/T010 | merged into `main` (`2b5f036`) | now 5 scenarios, one per new page |
-| Phase 2 onward | not specified | | | specified just in time |
+| Bot Studio (covers T021 to T024 and T030 to T037, paper only) | **done on branch, awaiting owner's review** | feature/bot-studio | see git log | built by Claude directly (owner's instruction, no delegation); live orders refused by design |
+| Phase 2 onward | remainder not specified | | | specified just in time; the Binance/FYERS order connectors (T025, T060, T080) are still to do |
 
 ## Log
 
@@ -65,3 +67,12 @@ _Planned deletion:_ Delete the Python backend after Phase 1 if parity tests have
 - **Not started and why:** T007 (Binance read-only) handles real API keys, so it must not run in the cloud or unsandboxed without a fresh owner decision (D1, D2), and uses Spot Testnet throwaway keys only. T008 (security review) needs T007. Phase 2 is not specified.
 - Plan artifacts that Antigravity writes land under `%USERPROFILE%\.gemini\antigravity-cli\brain\...`; the run log links to them.
 - Reminder: delete the Python backend after Phase 1 if the parity tests have moved to fixtures (T009).
+- 2026-11-04: **Bot Studio** built by Claude directly on `feature/bot-studio` (owner asked for no delegation). The previous Progress table was stale: T005 and T006 were already merged as `f41de44`; corrected above.
+  - **What it is:** a new page with six tabs (Explore Bots, My Bots, Create Bot, Strategy Library, Backtesting, Bot Performance). Server: `indicators.rs` (19 causal indicators), `strategy.rs` (declarative JSON strategies: signal rules, grid, DCA, pairs / stat-arb; 23 templates), `botengine.rs` (one bar engine for backtests and demo runs), `backtest2.rs` (Decimal P&L, Sharpe / Sortino / profit factor / drawdown, grid optimiser with in-sample / out-of-sample split), `risk.rs` + `orders.rs` (single order path: kill switch, account limits, bot limits, funds), `bots.rs` + `botapi.rs` (CRUD, lifecycle, runner, performance, HTTP API). Migration 5: `bots`, `bot_orders`, `bot_logs`, `backtests`, `account_limits`, plus nullable `bot_id` (and stop/target/trail) on `positions` / `trades`.
+  - **Execution rules:** signals on candle close, fills at the next open with fees and slippage; stop before target inside one bar; gaps fill at the open; trailing stops only move with finished bars; grid and DCA orders rest at prices fixed before the bar. Bots trade the demo account through the same `positions` / `trades` rows as manual orders, so they share its funds and appear in the Journal. Restart pauses every running bot; more than 3 missed candles are skipped, not replayed. Bots refuse to start on sample data.
+  - **Live:** not reachable. `risk::check` refuses every non-paper account; creating a Live bot is refused; `deploy-live` returns the gate checklist and 409. Arming exists (typed phrase, runtime only) but needs a connected live account, which cannot exist yet. Account limits and the kill switch now also bind manual ticket orders (no limits are set by default, so existing behaviour is unchanged).
+  - **Explore catalog:** Freqtrade, Hummingbot, Jesse, Superalgos, OctoBot (open source) and Gunbot, HaasOnline (commercial), described from their docs (checked 2026-11; prices and exchange counts left out on purpose). Every card says it is not integrated; "Add to My Bots" starts a ZoneBoard template and says which.
+  - **Verification:** 143 Rust tests (was 107), 0 warnings; 30 Python; `tools/ui_smoke.mjs` 6/6 (new Bot Studio scenario; 375px check covers the new page). Key tests: every indicator equals itself on any prefix of the data (no look-ahead); every template's backtest is unchanged before bar k when bars after k are altered; RSI matches the published Wilder worked example; runner test drives a demo bot through the real order manager and checks fills are bar opens and the wallet moved by exactly the bot's P&L; account limits and the kill switch bind bots. Mutations CAUGHT: kill-switch check removed, live refusal removed, bot capital limit removed, fill at the signal close instead of the next open. Driven end to end in Chromium on sample data with no console errors. **Not verified:** `tools/live_check.mjs` and a bot on live data (sandbox blocks Binance and Yahoo); the Tauri desktop window.
+  - **Real bugs found while building:** a percent trailing stop was frozen as a fixed distance at entry (fixed, test); a missing second-leg price serialised as `null` and silently reset a bot's saved state every tick (fixed, now `Option`, and an unreadable state is logged); the DCA template asked for 115% of its allocation (the validator caught it).
+- 2026-11-04: **Master roadmap, phases 0 to 7** (owner's instruction: no approvals between phases, Claude only). Status per feature in `docs/roadmap/progress.md`; results in `docs/testing/test-results.md`. Built: Binance connection (T007 scope plus order execution through an outbox, testnet by default, live behind arming + approval + limits), market-data quality, immutable strategy versions, walk-forward / Monte Carlo / regimes / replay, lifecycle and approvals, AI assistant without tools, scanner, portfolio, developer tokens / OpenAPI / SDK. Schema 4 → 8. **Blocked:** FYERS (spec U1 to U3), anything needing real keys or network. Nothing was run against a real exchange or real money.
+

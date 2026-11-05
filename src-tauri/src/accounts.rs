@@ -237,12 +237,12 @@ pub fn seed_from_legacy(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// One account as the API shows it. `"virtual": true` is set here, in the one place wallets are built, so
 /// no endpoint can return a demo balance without it.
 pub fn account_json(conn: &Connection, id: &str) -> Result<Value, AccountError> {
-    let row: Option<(String, String, String, String, String, i64)> = conn
-        .query_row("SELECT kind, label, environment, status, created_utc, archived FROM accounts WHERE id = ?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+    let row: Option<(String, String, String, String, String, i64, Option<String>, Option<String>, Option<String>)> = conn
+        .query_row("SELECT kind, label, environment, status, created_utc, archived, key_hint, last_sync_utc, last_error FROM accounts WHERE id = ?1", [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))
         })
         .optional()?;
-    let Some((kind, label, environment, status, created_utc, archived)) = row else {
+    let Some((kind, label, environment, status, created_utc, archived, key_hint, last_sync, last_error)) = row else {
         return Err(AccountError::NotFound);
     };
     let mut wallets = Vec::new();
@@ -257,10 +257,14 @@ pub fn account_json(conn: &Connection, id: &str) -> Result<Value, AccountError> 
         }
     }
     let open_positions: i64 = conn.query_row("SELECT count(*) FROM positions WHERE account_id = ?1", [id], |r| r.get(0))?;
+    // Only demo accounts hold virtual credits. A broker account's balances come from the broker
+    // (`/api/accounts/{id}/balances`), never from here.
+    let is_demo = kind == "demo";
     Ok(json!({
         "id": id, "kind": kind, "label": label, "environment": environment, "status": status,
-        "created_utc": created_utc, "archived": archived != 0, "virtual": true,
+        "created_utc": created_utc, "archived": archived != 0, "virtual": is_demo,
         "open_positions": open_positions, "wallets": wallets,
+        "key_hint": key_hint, "last_sync_utc": last_sync, "last_error": last_error,
     }))
 }
 
@@ -343,7 +347,8 @@ pub fn create(conn: &mut Connection, body: &Value) -> Result<Value, AccountError
     }
     match obj.get("kind").and_then(Value::as_str).unwrap_or("demo") {
         "demo" => {}
-        "binance" | "fyers" => return invalid("only demo accounts can be created yet; broker accounts arrive with T007"),
+        "fyers" => return invalid("FYERS connections are not built yet (see docs/fyers/SPEC.md)"),
+        "binance" => return invalid("Binance accounts are connected with api_key and api_secret (handled by connections.rs)"),
         _ => return invalid("kind must be demo"),
     }
     if let Some(e) = obj.get("environment") {

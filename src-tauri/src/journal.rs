@@ -38,6 +38,8 @@ pub struct Trade {
     pub pnl: f64,
     /// The demo account this trade belongs to. `None` for hand-entered live trades.
     pub account_id: Option<String>,
+    /// The bot that made this trade, if one did.
+    pub bot_id: Option<i64>,
 }
 
 /// An open paper position. Closing it writes a [`Trade`] and removes it.
@@ -53,6 +55,8 @@ pub struct Position {
     pub fee_pct: f64,
     pub opened_at: String,
     pub account_id: Option<String>,
+    /// The bot that holds this position, if one does. Closing it by hand is allowed: the bot sees it gone.
+    pub bot_id: Option<i64>,
 }
 
 /// Why a close failed: no such position, or the request itself was bad.
@@ -124,12 +128,12 @@ impl Journal {
         f(&mut conn)
     }
 
-    const TRADE_COLS: &'static str = "id, date, symbol, side, qty, entry, exit, fees, notes, market, mode, account_id";
+    const TRADE_COLS: &'static str = "id, date, symbol, side, qty, entry, exit, fees, notes, market, mode, account_id, bot_id";
 
     fn trade_from_row(r: &rusqlite::Row) -> rusqlite::Result<Trade> {
         let (side, qty, entry, exit, fees): (String, f64, f64, f64, f64) = (r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?);
         let gross = (exit - entry) * qty * if side == "long" { 1.0 } else { -1.0 };
-        Ok(Trade { id: r.get(0)?, date: r.get(1)?, symbol: r.get(2)?, side, qty, entry, exit, fees, notes: r.get(8)?, market: r.get(9)?, mode: r.get(10)?, pnl: round(gross - fees, 2), account_id: r.get(11)? })
+        Ok(Trade { id: r.get(0)?, date: r.get(1)?, symbol: r.get(2)?, side, qty, entry, exit, fees, notes: r.get(8)?, market: r.get(9)?, mode: r.get(10)?, pnl: round(gross - fees, 2), account_id: r.get(11)?, bot_id: r.get(12)? })
     }
 
     /// Reads for the demo account with no account named mean the default demo account; live reads are unchanged.
@@ -211,10 +215,10 @@ impl Journal {
     // Orders are simulated: a market order fills at the price the page sends (the real price on screen).
     // Closing a position records it as a trade. No broker is involved and no real money moves.
 
-    const POSITION_COLS: &'static str = "id, market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id";
+    pub(crate) const POSITION_COLS: &'static str = "id, market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id, bot_id";
 
-    fn position_from_row(r: &rusqlite::Row) -> rusqlite::Result<Position> {
-        Ok(Position { id: r.get(0)?, market: r.get(1)?, mode: r.get(2)?, symbol: r.get(3)?, side: r.get(4)?, qty: r.get(5)?, entry: r.get(6)?, fee_pct: r.get(7)?, opened_at: r.get(8)?, account_id: r.get(9)? })
+    pub(crate) fn position_from_row(r: &rusqlite::Row) -> rusqlite::Result<Position> {
+        Ok(Position { id: r.get(0)?, market: r.get(1)?, mode: r.get(2)?, symbol: r.get(3)?, side: r.get(4)?, qty: r.get(5)?, entry: r.get(6)?, fee_pct: r.get(7)?, opened_at: r.get(8)?, account_id: r.get(9)?, bot_id: r.get(10)? })
     }
 
     pub fn positions(&self, market: &str, mode: &str) -> Vec<Position> {
@@ -231,6 +235,12 @@ impl Journal {
     /// Open a position from `{market, mode, symbol, side, qty, price, account_id?}`. Fills at `price`.
     /// The order must fit the demo account's available virtual funds (`accounts::check_funds`).
     pub fn open_position(&self, body: &Value) -> Result<Position, String> {
+        self.open_position_checked(body, |_, _| Ok(()))
+    }
+
+    /// [`Self::open_position`] with an extra pre-trade check (kill switch, account risk limits) that runs inside
+    /// the order's transaction, after the funds check. It gets the account id and the parsed order.
+    pub fn open_position_checked(&self, body: &Value, check: impl FnOnce(&Connection, &crate::risk::Order) -> Result<(), String>) -> Result<Position, String> {
         let bad = |m: &str| Err(format!("invalid order: {m}"));
         let text = |k: &str, d: &str| match body.get(k).and_then(Value::as_str).unwrap_or("") {
             "" => d.to_string(),
@@ -271,6 +281,7 @@ impl Journal {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         crate::accounts::require_demo(&tx, account)?;
         crate::accounts::check_funds(&tx, account, &market, &symbol, qty, price)?;
+        check(&tx, &crate::risk::Order { account_id: account.to_string(), market: market.clone(), symbol: symbol.clone(), qty, price, bot: None })?;
         tx.execute(
             "INSERT INTO positions (market, mode, symbol, side, qty, entry, fee_pct, opened_at, account_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![market, mode, symbol, side, qty, price, fee_pct(&market), opened, account],
@@ -294,40 +305,54 @@ impl Journal {
             Some(_) => return Err(invalid("date must be YYYY-MM-DD".into())),
         };
         let mut conn = self.conn.lock().unwrap();
-        let db = |e: rusqlite::Error| CloseError::Invalid(e.to_string());
-        let tx = conn.transaction().map_err(db)?;
-        let sql = format!("SELECT {} FROM positions WHERE id = ?1", Self::POSITION_COLS);
-        let pos = tx.query_row(&sql, [id], Self::position_from_row).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => CloseError::NotFound,
-            e => db(e),
-        })?;
-        let day = date.unwrap_or_else(|| {
-            let tz = if pos.market == "india" { FixedOffset::east_opt(5 * 3600 + 1800).unwrap() } else { FixedOffset::east_opt(0).unwrap() };
-            Utc::now().with_timezone(&tz).format("%Y-%m-%d").to_string()
-        });
-        let fees = pos.fee_pct / 100.0 * pos.qty * (pos.entry + price); // both sides, at their own prices
-        // Exact P&L for the wallet. Computed before anything is written so an overflow (a silly close price)
-        // is a clean 400 and leaves the position open.
-        let net = crate::accounts::realised(&pos.side, pos.qty, pos.entry, price, fees).ok_or_else(|| invalid("price is too large".into()))?;
-        tx.execute(
-            "INSERT INTO trades (date, symbol, side, qty, entry, exit, fees, notes, market, mode, account_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![day, pos.symbol, pos.side, pos.qty, pos.entry, price, fees, "Paper trade", pos.market, pos.mode, pos.account_id],
-        )
-        .map_err(db)?;
-        let trade_id = tx.last_insert_rowid();
-        tx.execute("DELETE FROM positions WHERE id = ?1", [id]).map_err(db)?;
-        // Release the funds and apply the P&L in the same transaction as the trade and the delete.
-        if let Some(account) = &pos.account_id {
-            match crate::accounts::currency_for(&pos.market, &pos.symbol) {
-                Ok(currency) => crate::accounts::apply_pnl(&tx, account, currency, net).map_err(CloseError::Invalid)?,
-                Err(e) => tracing::warn!(account = %account, "closed position has no virtual wallet: {e}"),
-            }
-        }
-        let sql = format!("SELECT {} FROM trades WHERE id = ?1", Self::TRADE_COLS);
-        let trade = tx.query_row(&sql, [trade_id], Self::trade_from_row).map_err(db)?;
-        tx.commit().map_err(db)?;
+        let tx = conn.transaction().map_err(|e| CloseError::Invalid(e.to_string()))?;
+        let trade = close_in(&tx, id, price, date, "Paper trade")?;
+        tx.commit().map_err(|e| CloseError::Invalid(e.to_string()))?;
         Ok(trade)
     }
+}
+
+/// The market's calendar day for a trade date: IST for NSE, UTC for crypto.
+pub fn market_today(market: &str) -> String {
+    let tz = if market == "india" { FixedOffset::east_opt(5 * 3600 + 1800).unwrap() } else { FixedOffset::east_opt(0).unwrap() };
+    Utc::now().with_timezone(&tz).format("%Y-%m-%d").to_string()
+}
+
+/// Close position `id` at `price` inside the caller's transaction: records the trade (with the position's
+/// bot, if any), removes the position and moves the demo wallet. The one close path for manual and bot
+/// closes, so both book P&L the same way. Fees are the position's rate on each side's own notional.
+pub fn close_in(tx: &Connection, id: i64, price: f64, date: Option<String>, notes: &str) -> Result<Trade, CloseError> {
+    let invalid = |m: String| CloseError::Invalid(format!("invalid close: {m}"));
+    let db = |e: rusqlite::Error| CloseError::Invalid(e.to_string());
+    if !(price.is_finite() && price > 0.0) {
+        return Err(invalid("price must be a positive number".into()));
+    }
+    let sql = format!("SELECT {} FROM positions WHERE id = ?1", Journal::POSITION_COLS);
+    let pos = tx.query_row(&sql, [id], Journal::position_from_row).map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => CloseError::NotFound,
+        e => db(e),
+    })?;
+    let day = date.unwrap_or_else(|| market_today(&pos.market));
+    let fees = pos.fee_pct / 100.0 * pos.qty * (pos.entry + price); // both sides, at their own prices
+    // Exact P&L for the wallet. Computed before anything is written so an overflow (a silly close price)
+    // is a clean 400 and leaves the position open.
+    let net = crate::accounts::realised(&pos.side, pos.qty, pos.entry, price, fees).ok_or_else(|| invalid("price is too large".into()))?;
+    tx.execute(
+        "INSERT INTO trades (date, symbol, side, qty, entry, exit, fees, notes, market, mode, account_id, bot_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![day, pos.symbol, pos.side, pos.qty, pos.entry, price, fees, notes, pos.market, pos.mode, pos.account_id, pos.bot_id],
+    )
+    .map_err(db)?;
+    let trade_id = tx.last_insert_rowid();
+    tx.execute("DELETE FROM positions WHERE id = ?1", [id]).map_err(db)?;
+    // Release the funds and apply the P&L in the same transaction as the trade and the delete.
+    if let Some(account) = &pos.account_id {
+        match crate::accounts::currency_for(&pos.market, &pos.symbol) {
+            Ok(currency) => crate::accounts::apply_pnl(tx, account, currency, net).map_err(CloseError::Invalid)?,
+            Err(e) => tracing::warn!(account = %account, "closed position has no virtual wallet: {e}"),
+        }
+    }
+    let sql = format!("SELECT {} FROM trades WHERE id = ?1", Journal::TRADE_COLS);
+    tx.query_row(&sql, [trade_id], Journal::trade_from_row).map_err(db)
 }
 
 pub fn check_market_mode(market: &str, mode: &str) -> Result<(), String> {

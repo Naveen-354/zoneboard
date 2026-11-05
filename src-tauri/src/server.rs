@@ -11,7 +11,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::{FixedOffset, Utc};
@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
+use crate::botapi;
 use crate::data::{self, DataStore};
 use crate::journal::{self, Journal};
 use crate::zones::{self, Label, Summary};
@@ -77,16 +78,29 @@ pub fn render_index_html(template: &str, token: &str) -> String {
 }
 
 pub struct AppState {
-    data: DataStore,
-    journal: Journal,
+    pub(crate) data: DataStore,
+    pub(crate) journal: Journal,
     scan: [Mutex<Option<(Instant, Value)>>; 2], // indexed by `sample as usize`: sample and real scans never share a cache
     api_token: String,
+    /// Kill switch and live arming: runtime only, reset by a restart.
+    pub(crate) gate: crate::risk::Gate,
+    /// Broker credentials: the OS keychain in the app, an in-memory store in tests.
+    pub(crate) vault: Arc<dyn crate::vault::SecretStore>,
+    pub(crate) endpoints: crate::connections::Endpoints,
+    pub(crate) conn_cache: crate::connections::Cache,
+    pub(crate) ai: crate::ai::AiState,
+    pub(crate) dev_limiter: crate::devtokens::Limiter,
 }
 
 pub type Shared = Arc<AppState>;
 
 impl AppState {
     pub fn new(sample: bool, journal_path: &str) -> Result<Shared, String> {
+        Self::with_parts(sample, journal_path, Arc::new(crate::vault::KeychainStore::new()), crate::connections::Endpoints::default())
+    }
+
+    /// The state with a chosen vault and broker endpoints: tests use an in-memory vault and a fake exchange.
+    pub fn with_parts(sample: bool, journal_path: &str, vault: Arc<dyn crate::vault::SecretStore>, endpoints: crate::connections::Endpoints) -> Result<Shared, String> {
         let journal = Journal::open(journal_path).map_err(|e| format!("can't open journal {journal_path}: {e}"))?;
         journal.with_conn(|conn| {
             crate::audit::record(
@@ -100,13 +114,32 @@ impl AppState {
                 }),
             )
         }).map_err(|e| format!("can't record app_start audit entry: {e}"))?;
+        journal.with_conn(|conn| crate::bots::pause_all_on_start(conn));
         let api_token = generate_api_token();
         Ok(Arc::new(Self {
             data: DataStore::new(sample),
             journal,
             scan: [Mutex::new(None), Mutex::new(None)],
             api_token,
+            gate: crate::risk::Gate::default(),
+            vault,
+            endpoints,
+            conn_cache: crate::connections::Cache::default(),
+            ai: crate::ai::AiState::default(),
+            dev_limiter: crate::devtokens::Limiter::default(),
         }))
+    }
+
+    /// The journal (database), for integration tests and the runner.
+    #[doc(hidden)]
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
+    /// The kill switch and live arming, for integration tests.
+    #[doc(hidden)]
+    pub fn gate(&self) -> &crate::risk::Gate {
+        &self.gate
     }
 
     /// Read-only accessor for the in-memory API token.
@@ -129,7 +162,7 @@ pub fn sample_from_env() -> bool {
     std::env::var("SAMPLE_DATA").as_deref() == Ok("1")
 }
 
-fn err(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn err(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
@@ -147,8 +180,58 @@ pub fn app(state: Shared) -> Router {
         .route("/api/audit", get(audit_get))
         .route("/api/settings", get(settings_get).put(settings_put))
         .route("/api/accounts", get(accounts_get).post(accounts_create))
-        .route("/api/accounts/{id}", patch(accounts_patch))
+        .route("/api/accounts/{id}", patch(accounts_patch).delete(accounts_disconnect))
+        .route("/api/accounts/{id}/balances", get(accounts_balances))
+        .route("/api/accounts/{id}/verify", post(accounts_verify))
         .route("/api/accounts/{id}/reset", post(accounts_reset))
+        // Bot Studio (botapi.rs)
+        .route("/api/bots", get(botapi::bots_list).post(botapi::bots_create))
+        .route("/api/bots/{id}", get(botapi::bot_get).put(botapi::bot_update).delete(botapi::bot_delete))
+        .route("/api/bots/{id}/duplicate", post(botapi::bot_duplicate))
+        .route("/api/bots/{id}/start", post(botapi::bot_start))
+        .route("/api/bots/{id}/pause", post(botapi::bot_pause))
+        .route("/api/bots/{id}/stop", post(botapi::bot_stop))
+        .route("/api/bots/{id}/logs", get(botapi::bot_logs))
+        .route("/api/bots/{id}/backtests", get(botapi::bot_backtests))
+        .route("/api/bots/{id}/live", get(botapi::bot_readiness))
+        .route("/api/bots/{id}/deploy-live", post(botapi::bot_deploy_live))
+        .route("/api/market-data/health", get(botapi::market_health))
+        .route("/api/approvals", get(botapi::approvals_list))
+        .route("/api/bots/{id}/approval", post(botapi::approval_request))
+        .route("/api/approvals/{id}/decide", post(botapi::approval_decide))
+        .route("/api/approvals/{id}/revoke", post(botapi::approval_revoke))
+        .route("/api/system/health", get(botapi::system_health))
+        .route("/api/scanner", get(botapi::scanner_catalog))
+        .route("/api/dev/tokens", get(botapi::dev_tokens).post(botapi::dev_token_create))
+        .route("/api/dev/tokens/{id}", delete(botapi::dev_token_revoke))
+        .route("/api/openapi.json", get(botapi::openapi))
+        .route("/api/strategies/pack", get(botapi::strategies_pack).post(botapi::strategies_import_pack))
+        .route("/api/portfolio", get(botapi::portfolio))
+        .route("/api/portfolio/trades.csv", get(botapi::portfolio_csv))
+        .route("/api/scanner/run", post(botapi::scanner_run))
+        .route("/api/scanner/history", get(botapi::scanner_history))
+        .route("/api/ai/status", get(botapi::ai_status))
+        .route("/api/ai/key", put(botapi::ai_key_put).delete(botapi::ai_key_delete))
+        .route("/api/ai/settings", post(botapi::ai_settings))
+        .route("/api/ai/draft", post(botapi::ai_draft))
+        .route("/api/ai/explain/{id}", post(botapi::ai_explain))
+        .route("/api/ai/review", post(botapi::ai_review))
+        .route("/api/ai/proposals", get(botapi::ai_proposals))
+        .route("/api/backtest/walkforward", post(botapi::backtest_walkforward))
+        .route("/api/backtests/{id}/trades.csv", get(botapi::backtest_csv))
+        .route("/api/strategies", get(botapi::strategies_list).post(botapi::strategies_publish))
+        .route("/api/strategies/import", post(botapi::strategies_import))
+        .route("/api/strategies/{id}/versions", get(botapi::strategy_versions))
+        .route("/api/strategy-versions/{id}/export", get(botapi::strategy_export))
+        .route("/api/strategies/library", get(botapi::library))
+        .route("/api/backtest", post(botapi::backtest_run))
+        .route("/api/backtest/optimize", post(botapi::backtest_optimize))
+        .route("/api/backtests/{id}", get(botapi::backtest_get))
+        .route("/api/risk", get(botapi::risk_status))
+        .route("/api/risk/kill", post(botapi::risk_kill))
+        .route("/api/risk/limits/{account}", get(botapi::risk_limits_get).put(botapi::risk_limits_put))
+        .route("/api/live/arm", post(botapi::live_arm))
+        .route("/api/live/disarm", post(botapi::live_disarm))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -189,7 +272,16 @@ async fn guard(State(state): State<Shared>, req: Request, next: Next) -> Respons
             None => false,
         };
         if !valid {
-            return err(StatusCode::UNAUTHORIZED, "missing or invalid API token");
+            // a scoped developer token (Authorization: Bearer zbk_...) may stand in, for its scopes only
+            let bearer = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).filter(|t| t.starts_with("zbk_")).map(str::to_string);
+            let Some(tok) = bearer else {
+                return err(StatusCode::UNAUTHORIZED, "missing or invalid API token");
+            };
+            let m = req.method().as_str().to_string();
+            let p = path.to_string();
+            if let Err((code, msg)) = state.journal.with_conn(|c| crate::devtokens::authorize(c, &state.dev_limiter, &tok, &m, &p)) {
+                return err(StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN), msg);
+            }
         }
     }
 
@@ -360,7 +452,7 @@ fn market_mode(q: &HashMap<String, String>) -> Result<(&str, &str), Response> {
 
 /// A JSON request body, or Null. JSON only, like Flask's get_json(): a cross-site form post can't send
 /// this content type without a CORS preflight.
-fn json_body(headers: &HeaderMap, body: &[u8]) -> Value {
+pub(crate) fn json_body(headers: &HeaderMap, body: &[u8]) -> Value {
     let is_json = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("application/json"));
     if is_json {
         serde_json::from_slice(body).unwrap_or(Value::Null)
@@ -397,7 +489,8 @@ async fn positions_get(State(s): State<Shared>, Query(q): Query<HashMap<String, 
 }
 
 async fn positions_open(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
-    match s.journal.open_position(&json_body(&headers, &body)) {
+    // the same pre-trade checks bots get: kill switch and the account's risk limits
+    match s.journal.open_position_checked(&json_body(&headers, &body), |c, o| crate::risk::check(c, o, &s.gate)) {
         Ok(p) => (StatusCode::CREATED, Json(json!({ "ok": true, "position": p }))).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, &e),
     }
@@ -488,8 +581,34 @@ async fn accounts_get(State(s): State<Shared>) -> Response {
     account_response(s.journal.with_conn(|c| crate::accounts::list(c)), StatusCode::OK)
 }
 
+fn conn_response(r: Result<Value, crate::connections::ConnError>, ok: StatusCode) -> Response {
+    use crate::connections::ConnError;
+    match r {
+        Ok(v) => (ok, Json(v)).into_response(),
+        Err(ConnError::Bad(m)) => err(StatusCode::BAD_REQUEST, &m),
+        Err(ConnError::NotFound) => err(StatusCode::NOT_FOUND, "no such account"),
+        Err(ConnError::Conflict(m)) => err(StatusCode::CONFLICT, &m),
+        Err(ConnError::Upstream(m)) => err(StatusCode::BAD_GATEWAY, &m),
+    }
+}
+
+async fn accounts_balances(State(s): State<Shared>, Path(id): Path<String>) -> Response {
+    conn_response(crate::connections::balances(&s, &id).await, StatusCode::OK)
+}
+
+async fn accounts_verify(State(s): State<Shared>, Path(id): Path<String>) -> Response {
+    conn_response(crate::connections::verify(&s, &id).await, StatusCode::OK)
+}
+
+async fn accounts_disconnect(State(s): State<Shared>, Path(id): Path<String>) -> Response {
+    conn_response(crate::connections::disconnect(&s, &id).await, StatusCode::OK)
+}
+
 async fn accounts_create(State(s): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     let b = json_body(&headers, &body);
+    if b.get("kind").and_then(Value::as_str) == Some("binance") {
+        return conn_response(crate::connections::connect(&s, &b).await, StatusCode::CREATED);
+    }
     account_response(s.journal.with_conn(|c| crate::accounts::create(c, &b)), StatusCode::CREATED)
 }
 
@@ -526,6 +645,7 @@ pub fn port_of(listeners: &[TcpListener]) -> u16 {
 }
 
 pub async fn serve(listeners: Vec<TcpListener>, state: Shared) -> std::io::Result<()> {
+    tokio::spawn(botapi::run_forever(state.clone()));
     let router = app(state);
     let mut tasks = tokio::task::JoinSet::new();
     for l in listeners {

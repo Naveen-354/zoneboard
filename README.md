@@ -117,6 +117,18 @@ Only for development: `SAMPLE_DATA=1` (PowerShell: `$env:SAMPLE_DATA = "1"`) on 
 - To check the live pipeline from this machine without opening the app: `node tools/live_check.mjs` (REST, WebSocket ticks, and zone analysis on real candles).
 - To smoke-test the UI in a headless browser (sample data, temp journal, no internet): build the server once (`cd src-tauri && cargo build --no-default-features --bin zoneboard-server`), then `node tools/ui_smoke.mjs`.
 
+## Bot Studio
+
+A page for building, testing and running trading bots on the **demo account** (virtual funds, real prices).
+
+- **Explore Bots:** well-known bots (Freqtrade, Hummingbot, Jesse, Superalgos, OctoBot; Gunbot and HaasOnline are commercial) described from their own docs, with links. ZoneBoard does not run or connect to them; *Add to My Bots* starts the closest ZoneBoard template and says so.
+- **Create Bot:** a visual builder (indicators, ALL / ANY rule groups, stop-loss, take-profit, trailing stop, sizing, capital and limits) with the same strategy as editable JSON. Strategy kinds: indicator signals, grid, DCA, pairs and statistical arbitrage.
+- **Strategy Library:** 19 indicators and 23 ready-made strategies (trend, momentum, mean reversion, volume, advanced).
+- **Backtesting:** signals on candle close, fills at the next open, fees and slippage, stop before target inside a candle. Metrics: return, buy-and-hold, win rate, profit factor, Sharpe, Sortino, drawdown, exposure. Optimisation is a grid search judged on out-of-sample data.
+- **My Bots / Bot Performance:** start, pause, stop, edit, duplicate, delete; P&L, win rate, profit factor and drawdown from the bot's recorded fills; open positions; execution log (including refused orders); account risk limits; kill switch; live-readiness checklist.
+
+Bots run in the server (not the browser tab) and act on candle closes. Every bot order passes the kill switch, the account's limits, the bot's limits and the funds check. A restart pauses every bot. **Live trading is not available:** no broker order connector exists, so the order path refuses any non-paper account. Bots cannot start while sample data is on.
+
 ## Backtest
 
 ```bash

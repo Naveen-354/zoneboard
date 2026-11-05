@@ -314,6 +314,64 @@ const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
     ("POST", "/api/accounts", "/api/accounts", Some(r#"{"kind":"demo","label":"Second"}"#)),
     ("PATCH", "/api/accounts/{id}", "/api/accounts/demo-1", Some(r#"{"label":"Renamed"}"#)),
     ("POST", "/api/accounts/{id}/reset", "/api/accounts/demo-1/reset", None),
+    ("GET", "/api/bots", "/api/bots", None),
+    ("POST", "/api/bots", "/api/bots", Some(r#"{"name":"x"}"#)),
+    ("GET", "/api/bots/{id}", "/api/bots/999999", None),
+    ("PUT", "/api/bots/{id}", "/api/bots/999999", Some(r#"{"name":"x"}"#)),
+    ("DELETE", "/api/bots/{id}", "/api/bots/999999", None),
+    ("POST", "/api/bots/{id}/duplicate", "/api/bots/999999/duplicate", None),
+    ("POST", "/api/bots/{id}/start", "/api/bots/999999/start", None),
+    ("POST", "/api/bots/{id}/pause", "/api/bots/999999/pause", None),
+    ("POST", "/api/bots/{id}/stop", "/api/bots/999999/stop", None),
+    ("GET", "/api/bots/{id}/logs", "/api/bots/999999/logs", None),
+    ("GET", "/api/bots/{id}/backtests", "/api/bots/999999/backtests", None),
+    ("GET", "/api/bots/{id}/live", "/api/bots/999999/live", None),
+    ("POST", "/api/bots/{id}/deploy-live", "/api/bots/999999/deploy-live", None),
+    ("GET", "/api/strategies/library", "/api/strategies/library", None),
+    ("POST", "/api/backtest/walkforward", "/api/backtest/walkforward", Some(r#"{"symbol":"BTCUSDT"}"#)),
+    ("GET", "/api/backtests/{id}/trades.csv", "/api/backtests/999999/trades.csv", None),
+    ("GET", "/api/strategies", "/api/strategies", None),
+    ("GET", "/api/approvals", "/api/approvals", None),
+    ("POST", "/api/bots/{id}/approval", "/api/bots/999999/approval", None),
+    ("POST", "/api/approvals/{id}/decide", "/api/approvals/999999/decide", Some(r#"{"approve":false}"#)),
+    ("POST", "/api/approvals/{id}/revoke", "/api/approvals/999999/revoke", None),
+    ("GET", "/api/system/health", "/api/system/health", None),
+    ("GET", "/api/ai/status", "/api/ai/status", None),
+    ("GET", "/api/scanner", "/api/scanner", None),
+    ("GET", "/api/dev/tokens", "/api/dev/tokens", None),
+    ("POST", "/api/dev/tokens", "/api/dev/tokens", Some(r#"{"name":"x","scopes":["read"]}"#)),
+    ("DELETE", "/api/dev/tokens/{id}", "/api/dev/tokens/999999", None),
+    ("GET", "/api/openapi.json", "/api/openapi.json", None),
+    ("GET", "/api/strategies/pack", "/api/strategies/pack", None),
+    ("POST", "/api/strategies/pack", "/api/strategies/pack", Some(r#"{}"#)),
+    ("GET", "/api/portfolio", "/api/portfolio", None),
+    ("GET", "/api/portfolio/trades.csv", "/api/portfolio/trades.csv", None),
+    ("POST", "/api/scanner/run", "/api/scanner/run", Some(r#"{"template":"nope"}"#)),
+    ("GET", "/api/scanner/history", "/api/scanner/history", None),
+    ("PUT", "/api/ai/key", "/api/ai/key", Some(r#"{"api_key":"x"}"#)),
+    ("DELETE", "/api/ai/key", "/api/ai/key", None),
+    ("POST", "/api/ai/settings", "/api/ai/settings", Some(r#"{}"#)),
+    ("POST", "/api/ai/draft", "/api/ai/draft", Some(r#"{"objective":"x"}"#)),
+    ("POST", "/api/ai/explain/{id}", "/api/ai/explain/999999", None),
+    ("POST", "/api/ai/review", "/api/ai/review", Some(r#"{}"#)),
+    ("GET", "/api/ai/proposals", "/api/ai/proposals", None),
+    ("POST", "/api/strategies", "/api/strategies", Some(r#"{"name":"x"}"#)),
+    ("POST", "/api/strategies/import", "/api/strategies/import", Some(r#"{}"#)),
+    ("GET", "/api/strategies/{id}/versions", "/api/strategies/999999/versions", None),
+    ("GET", "/api/strategy-versions/{id}/export", "/api/strategy-versions/999999/export", None),
+    ("GET", "/api/market-data/health", "/api/market-data/health?market=crypto&symbol=BTCUSDT&interval=1h", None),
+    ("DELETE", "/api/accounts/{id}", "/api/accounts/demo-1", None),
+    ("GET", "/api/accounts/{id}/balances", "/api/accounts/demo-1/balances", None),
+    ("POST", "/api/accounts/{id}/verify", "/api/accounts/demo-1/verify", None),
+    ("POST", "/api/backtest", "/api/backtest", Some(r#"{"symbol":"BTCUSDT","spec":{"kind":"nope"}}"#)),
+    ("POST", "/api/backtest/optimize", "/api/backtest/optimize", Some(r#"{"symbol":"BTCUSDT"}"#)),
+    ("GET", "/api/backtests/{id}", "/api/backtests/999999", None),
+    ("GET", "/api/risk", "/api/risk", None),
+    ("POST", "/api/risk/kill", "/api/risk/kill", Some(r#"{"engaged":false}"#)),
+    ("GET", "/api/risk/limits/{account}", "/api/risk/limits/demo-1", None),
+    ("PUT", "/api/risk/limits/{account}", "/api/risk/limits/demo-1", Some(r#"{}"#)),
+    ("POST", "/api/live/arm", "/api/live/arm", Some(r#"{"confirm":"no"}"#)),
+    ("POST", "/api/live/disarm", "/api/live/disarm", None),
 ];
 
 #[tokio::test]
@@ -994,4 +1052,155 @@ async fn account_responses_and_audit_rows_never_carry_secret_shaped_data() {
     for word in ["secret", "api_key", "apikey", "password"] {
         assert!(!text.to_lowercase().contains(word), "{word}");
     }
+}
+
+async fn send(app: &TestApp, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let (s, _, b) = call(app, method, uri, "localhost", body, &[]).await;
+    (s, serde_json::from_slice(&b).unwrap_or(Value::Null))
+}
+
+/// The Bot Studio flow over HTTP, on sample data: library, create, backtest (saved), optimise, the live
+/// refusals, limits that bind manual orders, the kill switch, edit / duplicate / delete.
+#[tokio::test]
+async fn bot_studio_flow() {
+    let r = router();
+    let (s, lib) = get_json(&r, "/api/strategies/library").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(lib["indicators"].as_array().unwrap().len() >= 19);
+    let spec = lib["templates"].as_array().unwrap().iter().find(|t| t["id"] == "ema_cross").unwrap()["spec"].clone();
+
+    let (s, bot) = send(&r, "POST", "/api/bots", Some(json!({ "name": "EMA", "market": "crypto", "symbol": "BTCUSDT", "interval": "1h", "spec": spec, "allocation": "1000", "source": "freqtrade" }))).await;
+    assert_eq!(s, StatusCode::CREATED, "{bot}");
+    assert_eq!(bot["mode"], "demo");
+    assert_eq!(bot["virtual"], true);
+    let id = bot["id"].as_i64().unwrap();
+    let (s, e) = send(&r, "POST", "/api/bots", Some(json!({ "name": "L", "symbol": "BTCUSDT", "spec": spec, "allocation": "1", "mode": "live" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{e}");
+
+    // backtest on sample data, saved against the bot
+    let (s, bt) = send(&r, "POST", "/api/backtest", Some(json!({ "bot_id": id, "bars": 500, "save": true }))).await;
+    assert_eq!(s, StatusCode::OK, "{bt}");
+    assert_eq!(bt["data"]["sample"], true);
+    assert!(bt["data"]["source"].as_str().unwrap().contains("SAMPLE"));
+    assert!(bt["metrics"]["trades"].is_u64() && bt["candles"].as_array().unwrap().len() > 100);
+    let saved = bt["saved_id"].as_i64().unwrap();
+    assert_eq!(bt["reproducibility"]["engine_version"], "botengine-2");
+    assert_eq!(bt["reproducibility"]["dataset_hash"].as_str().unwrap().len(), 64);
+    assert!(bt["regimes"].is_array() && bt["monte_carlo"].is_object());
+    // same request, same answer (reproducible)
+    let (_, bt2) = send(&r, "POST", "/api/backtest", Some(json!({ "bot_id": id, "bars": 500 }))).await;
+    assert_eq!(bt2["metrics"], bt["metrics"]);
+    assert_eq!(bt2["reproducibility"], bt["reproducibility"]);
+    let (s, _, csv) = call(&r, "GET", &format!("/api/backtests/{saved}/trades.csv"), "localhost", None, &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&csv).starts_with("leg,side,tag,qty"));
+    // the bot is pinned to an exact strategy version; export / import round-trips it
+    let vid = bot["strategy_version"]["id"].as_i64().unwrap();
+    let (s, doc) = send(&r, "GET", &format!("/api/strategy-versions/{vid}/export"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, imp) = send(&r, "POST", "/api/strategies/import", Some(doc)).await;
+    assert_eq!(s, StatusCode::CREATED, "{imp}");
+    assert_eq!(imp["version_id"].as_i64(), Some(vid), "same content, same version");
+    let (s, wf) = send(&r, "POST", "/api/backtest/walkforward", Some(json!({ "bot_id": id, "bars": 800, "folds": 3, "objective": "return", "params": [{ "path": "/indicators/0/params/period", "values": [5, 9] }] }))).await;
+    assert_eq!(s, StatusCode::OK, "{wf}");
+    assert_eq!(wf["folds"].as_array().unwrap().len(), 3);
+    assert_eq!(get_json(&r, &format!("/api/backtests/{saved}")).await.0, StatusCode::OK);
+    assert_eq!(get_json(&r, &format!("/api/bots/{id}/backtests")).await.1["backtests"].as_array().unwrap().len(), 1);
+
+    let (s, opt) = send(&r, "POST", "/api/backtest/optimize", Some(json!({ "bot_id": id, "bars": 600, "objective": "return", "params": [{ "path": "/indicators/0/params/period", "values": [5, 9] }] }))).await;
+    assert_eq!(s, StatusCode::OK, "{opt}");
+    assert_eq!(opt["results"].as_array().unwrap().len(), 2);
+
+    // bots never trade made-up prices
+    let (s, e) = send(&r, "POST", &format!("/api/bots/{id}/start"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert!(e["error"].as_str().unwrap().contains("sample"));
+    let (s, d) = send(&r, "POST", &format!("/api/bots/{id}/deploy-live"), None).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(d["readiness"]["can_trade_live"], false);
+    let (s, a) = send(&r, "POST", "/api/live/arm", Some(json!({ "confirm": "ARM LIVE TRADING", "account_id": "demo-1" }))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "{a}");
+
+    // account limits bind manual ticket orders too
+    let (s, _) = send(&r, "PUT", "/api/risk/limits/demo-1", Some(json!({ "USDT": { "max_order_notional": "100" } }))).await;
+    assert_eq!(s, StatusCode::OK);
+    let order = json!({"market":"crypto","mode":"demo","symbol":"BTCUSDT","side":"long","qty":0.01,"price":78000});
+    let (s, e) = send(&r, "POST", "/api/positions", Some(order.clone())).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().contains("max order size"), "{e}");
+    send(&r, "PUT", "/api/risk/limits/demo-1", Some(json!({ "USDT": { "max_order_notional": null } }))).await;
+    assert_eq!(send(&r, "POST", "/api/positions", Some(order.clone())).await.0, StatusCode::CREATED);
+
+    // kill switch blocks new orders until released
+    let (s, k) = send(&r, "POST", "/api/risk/kill", Some(json!({ "engaged": true }))).await;
+    assert_eq!((s, k["kill_switch"].clone()), (StatusCode::OK, json!(true)));
+    assert!(send(&r, "POST", "/api/positions", Some(order.clone())).await.1["error"].as_str().unwrap().contains("kill switch"));
+    send(&r, "POST", "/api/risk/kill", Some(json!({ "engaged": false }))).await;
+    assert_eq!(send(&r, "POST", "/api/positions", Some(order)).await.0, StatusCode::CREATED);
+
+    // edit, duplicate, logs, delete
+    let (s, b2) = send(&r, "PUT", &format!("/api/bots/{id}"), Some(json!({ "name": "EMA v2" }))).await;
+    assert_eq!((s, b2["name"].clone()), (StatusCode::OK, json!("EMA v2")));
+    let (s, dup) = send(&r, "POST", &format!("/api/bots/{id}/duplicate"), None).await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert!(get_json(&r, &format!("/api/bots/{id}/logs")).await.1["logs"].as_array().unwrap().len() >= 2);
+    assert_eq!(send(&r, "DELETE", &format!("/api/bots/{}", dup["id"]), None).await.0, StatusCode::OK);
+    assert_eq!(get_json(&r, "/api/bots").await.1["bots"].as_array().unwrap().len(), 1);
+    // audit trail
+    let (_, audit) = get_json(&r, "/api/audit?limit=100").await;
+    let actions: Vec<&str> = audit["entries"].as_array().unwrap().iter().filter_map(|e| e["action"].as_str()).collect();
+    for a in ["bot_created", "bot_updated", "bot_deleted", "risk_limits_updated", "kill_switch_on", "kill_switch_off"] {
+        assert!(actions.contains(&a), "missing audit {a}: {actions:?}");
+    }
+}
+
+#[tokio::test]
+async fn scanner_runs_on_sample_data_with_source_and_formula() {
+    let r = router();
+    let (s, cat) = get_json(&r, "/api/scanner").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(cat["unsupported"].as_array().unwrap().len() >= 3);
+    let (s, out) = send(&r, "POST", "/api/scanner/run", Some(json!({ "template": "movers", "market": "india", "interval": "1d", "params": { "lookback": 5, "threshold_pct": 0.1 } }))).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert!(out["source"].as_str().unwrap().contains("SAMPLE"));
+    assert!(out["formula"].as_str().unwrap().contains("threshold_pct"));
+    assert!(out["scanned"].as_u64().unwrap() > 50);
+    assert!(!out["results"].as_array().unwrap().is_empty());
+    assert_eq!(send(&r, "POST", "/api/scanner/run", Some(json!({ "template": "gap", "market": "crypto" }))).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(get_json(&r, "/api/scanner/history").await.1["runs"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn openapi_lists_every_route() {
+    let source = include_str!("../src/server.rs");
+    for (idx, _) in source.match_indices(".route(\"/api/") {
+        let rest = &source[idx + ".route(\"".len()..];
+        let path = &rest[..rest.find('"').unwrap()];
+        assert!(zoneboard::botapi::API_DOC.iter().any(|(_, p, _)| *p == path), "{path} is missing from API_DOC (openapi.json)");
+    }
+}
+
+#[tokio::test]
+async fn developer_tokens_are_scoped_and_cannot_reach_safety_controls() {
+    let r = router();
+    let (s, t) = send(&r, "POST", "/api/dev/tokens", Some(json!({ "name": "notebook", "scopes": ["read", "research"] }))).await;
+    assert_eq!(s, StatusCode::CREATED, "{t}");
+    let tok = t["token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {tok}");
+    let dev = |m: &'static str, uri: &'static str, body: Option<Value>| {
+        let (r, b) = (&r, bearer.clone());
+        async move { call_without_token(r, m, uri, "localhost", body, &[("Authorization", b.as_str())]).await.0 }
+    };
+    assert_eq!(dev("GET", "/api/bots", None).await, StatusCode::OK);
+    assert_eq!(dev("GET", "/api/openapi.json", None).await, StatusCode::OK);
+    assert_eq!(dev("POST", "/api/scanner/run", Some(json!({ "template": "movers", "market": "india" }))).await, StatusCode::OK);
+    assert_eq!(dev("POST", "/api/bots/1/start", None).await, StatusCode::FORBIDDEN, "no trade scope");
+    for (m, uri) in [("POST", "/api/live/arm"), ("POST", "/api/risk/kill"), ("GET", "/api/accounts"), ("POST", "/api/dev/tokens"), ("GET", "/api/dev/tokens"), ("PUT", "/api/ai/key"), ("POST", "/api/approvals/1/decide")] {
+        assert_eq!(dev(m, uri, Some(json!({}))).await, StatusCode::FORBIDDEN, "{m} {uri}");
+    }
+    let (_, list) = get_json(&r, "/api/dev/tokens").await;
+    assert!(!list.to_string().contains(&tok), "the token is never shown again");
+    let id = t["id"].as_i64().unwrap();
+    assert_eq!(send(&r, "DELETE", &format!("/api/dev/tokens/{id}"), None).await.0, StatusCode::OK);
+    assert_eq!(dev("GET", "/api/bots", None).await, StatusCode::UNAUTHORIZED, "revoked");
 }

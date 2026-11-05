@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 
 /// The latest schema version supported by this application.
-pub const CURRENT_VERSION: u32 = 4;
+pub const CURRENT_VERSION: u32 = 8;
 
 /// Database error type covering schema version mismatches, SQLite errors, and IO issues.
 #[derive(Debug)]
@@ -252,6 +252,252 @@ pub fn migrate(conn: &mut Connection) -> Result<(), DbError> {
         )?;
         crate::accounts::seed_from_legacy(&tx)?;
         tx.execute_batch("PRAGMA user_version = 4;")?;
+        tx.commit()?;
+        ver = 4;
+    }
+
+    if ver < 5 {
+        let tx = conn.transaction()?;
+        // Migration 5: bots, their orders and logs, saved backtests, and per-account risk limits (Bot Studio).
+        // Bot positions and trades live in the existing `positions` / `trades` tables, tagged with `bot_id`, so
+        // they reserve the same virtual funds as manual orders and show in the Journal. New columns are
+        // nullable: existing rows are manual and stay that way. Money columns are decimal TEXT.
+        tx.execute_batch(
+            "CREATE TABLE bots (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 60),
+                description  TEXT NOT NULL DEFAULT '' CHECK (length(description) <= 500),
+                avatar       TEXT NOT NULL DEFAULT '',
+                market       TEXT NOT NULL CHECK (market IN ('crypto','india')),
+                exchange     TEXT NOT NULL CHECK (exchange IN ('binance','fyers')),
+                mode         TEXT NOT NULL CHECK (mode IN ('demo','live')),
+                account_id   TEXT NOT NULL REFERENCES accounts(id),
+                symbol       TEXT NOT NULL,
+                symbol2      TEXT,
+                interval     TEXT NOT NULL,
+                spec         TEXT NOT NULL,
+                template     TEXT,
+                source       TEXT,
+                allocation   TEXT NOT NULL,
+                max_daily_loss TEXT,
+                max_open_positions INTEGER NOT NULL DEFAULT 10 CHECK (max_open_positions BETWEEN 1 AND 100),
+                slippage_pct REAL NOT NULL DEFAULT 0.05,
+                status       TEXT NOT NULL DEFAULT 'stopped' CHECK (status IN ('stopped','running','paused')),
+                state        TEXT NOT NULL DEFAULT '{}',
+                last_price   REAL,
+                last_price_utc TEXT,
+                last_error   TEXT,
+                created_utc  TEXT NOT NULL,
+                updated_utc  TEXT NOT NULL,
+                started_utc  TEXT
+            );
+            CREATE TABLE bot_orders (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id      INTEGER NOT NULL,
+                ts_utc      TEXT NOT NULL,
+                bar_time    INTEGER,
+                symbol      TEXT NOT NULL,
+                side        TEXT NOT NULL,
+                action      TEXT NOT NULL CHECK (action IN ('open','close')),
+                qty         REAL NOT NULL,
+                price       REAL NOT NULL,
+                status      TEXT NOT NULL CHECK (status IN ('filled','rejected')),
+                reason      TEXT NOT NULL DEFAULT '',
+                position_id INTEGER,
+                trade_id    INTEGER
+            );
+            CREATE INDEX idx_bot_orders_bot ON bot_orders(bot_id, id);
+            CREATE TABLE bot_logs (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id  INTEGER NOT NULL,
+                ts_utc  TEXT NOT NULL,
+                level   TEXT NOT NULL,
+                message TEXT NOT NULL
+            );
+            CREATE INDEX idx_bot_logs_bot ON bot_logs(bot_id, id);
+            CREATE TABLE backtests (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id      INTEGER,
+                created_utc TEXT NOT NULL,
+                request     TEXT NOT NULL,
+                metrics     TEXT NOT NULL,
+                report      TEXT NOT NULL
+            );
+            CREATE INDEX idx_backtests_bot ON backtests(bot_id, id);
+            CREATE TABLE account_limits (
+                account_id         TEXT NOT NULL REFERENCES accounts(id),
+                currency           TEXT NOT NULL CHECK (currency IN ('USDT','INR')),
+                max_order_notional TEXT,
+                max_daily_loss     TEXT,
+                max_exposure       TEXT,
+                PRIMARY KEY (account_id, currency)
+            );
+            ALTER TABLE positions ADD COLUMN bot_id INTEGER;
+            ALTER TABLE positions ADD COLUMN leg INTEGER;
+            ALTER TABLE positions ADD COLUMN stop REAL;
+            ALTER TABLE positions ADD COLUMN target REAL;
+            ALTER TABLE positions ADD COLUMN trail TEXT;
+            ALTER TABLE positions ADD COLUMN trail_ref REAL;
+            ALTER TABLE positions ADD COLUMN tag TEXT;
+            ALTER TABLE positions ADD COLUMN bar_time INTEGER;
+            ALTER TABLE trades ADD COLUMN bot_id INTEGER;
+            CREATE INDEX idx_positions_bot ON positions(bot_id);
+            CREATE INDEX idx_trades_bot ON trades(bot_id);
+            PRAGMA user_version = 5;",
+        )?;
+        tx.commit()?;
+        ver = 5;
+    }
+
+    if ver < 6 {
+        let tx = conn.transaction()?;
+        // Migration 6: broker connections (T007). Only non-secret metadata: the key hint (last 4 characters)
+        // and sync times. Credentials live in the OS vault, never here.
+        tx.execute_batch(
+            "ALTER TABLE accounts ADD COLUMN key_hint TEXT;
+            ALTER TABLE accounts ADD COLUMN connected_utc TEXT;
+            ALTER TABLE accounts ADD COLUMN last_sync_utc TEXT;
+            ALTER TABLE accounts ADD COLUMN last_error TEXT;
+            PRAGMA user_version = 6;",
+        )?;
+        tx.commit()?;
+        ver = 6;
+    }
+
+    if ver < 7 {
+        let tx = conn.transaction()?;
+        // Migration 7: immutable strategy versions, bot lifecycle stage and order idempotency, live-deployment
+        // approvals, AI proposals and their audit, scoped developer tokens (hash only), scan history and worker
+        // heartbeats. Additive only; existing rows keep their meaning.
+        tx.execute_batch(
+            "CREATE TABLE strategies (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 60),
+                created_utc TEXT NOT NULL
+            );
+            CREATE TABLE strategy_versions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_id INTEGER NOT NULL REFERENCES strategies(id),
+                version     INTEGER NOT NULL,
+                spec        TEXT NOT NULL,
+                hash        TEXT NOT NULL,
+                note        TEXT NOT NULL DEFAULT '',
+                created_utc TEXT NOT NULL,
+                UNIQUE (strategy_id, version),
+                UNIQUE (strategy_id, hash)
+            );
+            CREATE TRIGGER strategy_versions_immutable_update BEFORE UPDATE ON strategy_versions
+              BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable: publish a new version'); END;
+            CREATE TRIGGER strategy_versions_immutable_delete BEFORE DELETE ON strategy_versions
+              BEGIN SELECT RAISE(ABORT, 'strategy versions are immutable'); END;
+            ALTER TABLE bots ADD COLUMN strategy_version_id INTEGER;
+            ALTER TABLE bots ADD COLUMN stage TEXT NOT NULL DEFAULT 'draft';
+            ALTER TABLE bot_orders ADD COLUMN client_order_id TEXT;
+            ALTER TABLE bot_orders ADD COLUMN broker_order_id TEXT;
+            ALTER TABLE bot_orders ADD COLUMN environment TEXT;
+            CREATE UNIQUE INDEX idx_bot_orders_client_id ON bot_orders(client_order_id) WHERE client_order_id IS NOT NULL AND status = 'filled';
+            ALTER TABLE backtests ADD COLUMN strategy_version_id INTEGER;
+            ALTER TABLE backtests ADD COLUMN engine_version TEXT;
+            ALTER TABLE backtests ADD COLUMN dataset_hash TEXT;
+            CREATE TABLE approvals (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id        INTEGER NOT NULL,
+                strategy_version_id INTEGER NOT NULL,
+                spec_hash     TEXT NOT NULL,
+                account_id    TEXT NOT NULL,
+                scope         TEXT NOT NULL,
+                requested_by  TEXT NOT NULL,
+                requested_utc TEXT NOT NULL,
+                expires_utc   TEXT NOT NULL,
+                status        TEXT NOT NULL CHECK (status IN ('pending','approved','rejected','revoked','expired')),
+                decided_by    TEXT,
+                decided_utc   TEXT,
+                reason        TEXT,
+                evidence      TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX idx_approvals_bot ON approvals(bot_id, id);
+            CREATE TABLE ai_proposals (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_utc  TEXT NOT NULL,
+                provider     TEXT NOT NULL,
+                model        TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                objective    TEXT NOT NULL,
+                output       TEXT NOT NULL,
+                spec         TEXT,
+                valid        INTEGER NOT NULL DEFAULT 0,
+                errors       TEXT,
+                status       TEXT NOT NULL DEFAULT 'draft'
+            );
+            CREATE TABLE ai_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_utc      TEXT NOT NULL,
+                proposal_id INTEGER,
+                kind        TEXT NOT NULL,
+                detail      TEXT NOT NULL
+            );
+            CREATE TABLE api_tokens (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL,
+                scopes       TEXT NOT NULL,
+                token_hash   TEXT NOT NULL UNIQUE,
+                hint         TEXT NOT NULL,
+                created_utc  TEXT NOT NULL,
+                last_used_utc TEXT,
+                revoked_utc  TEXT
+            );
+            CREATE TABLE scan_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_utc TEXT NOT NULL,
+                template    TEXT NOT NULL,
+                request     TEXT NOT NULL,
+                results     TEXT NOT NULL
+            );
+            CREATE TABLE workers (
+                name          TEXT PRIMARY KEY,
+                started_utc   TEXT NOT NULL,
+                heartbeat_utc TEXT NOT NULL,
+                detail        TEXT NOT NULL DEFAULT '{}'
+            );
+            PRAGMA user_version = 7;",
+        )?;
+        tx.commit()?;
+        ver = 7;
+    }
+
+    if ver < 8 {
+        let tx = conn.transaction()?;
+        // Migration 8: the broker-order outbox. A row is written (status 'submitting') BEFORE an order is sent,
+        // keyed by a deterministic client order id, so a crash or a lost reply can be reconciled with the
+        // exchange instead of resending. The unique key makes a duplicate submission impossible.
+        tx.execute_batch(
+            "CREATE TABLE broker_orders (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id          INTEGER NOT NULL,
+                account_id      TEXT NOT NULL,
+                client_order_id TEXT NOT NULL UNIQUE,
+                symbol          TEXT NOT NULL,
+                side            TEXT NOT NULL CHECK (side IN ('BUY','SELL')),
+                action          TEXT NOT NULL CHECK (action IN ('open','close')),
+                qty             TEXT NOT NULL,
+                position_id     INTEGER,
+                bar_time        INTEGER,
+                tag             TEXT NOT NULL DEFAULT '',
+                stop            REAL,
+                target          REAL,
+                trail           TEXT,
+                status          TEXT NOT NULL CHECK (status IN ('submitting','filled','rejected','unknown')),
+                broker_order_id TEXT,
+                executed_qty    TEXT,
+                avg_price       TEXT,
+                reason          TEXT NOT NULL DEFAULT '',
+                created_utc     TEXT NOT NULL,
+                updated_utc     TEXT NOT NULL
+            );
+            CREATE INDEX idx_broker_orders_status ON broker_orders(status);
+            PRAGMA user_version = 8;",
+        )?;
         tx.commit()?;
     }
 

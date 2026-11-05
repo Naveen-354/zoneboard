@@ -223,7 +223,7 @@ $("#mode").addEventListener("click", (e) => {
 $("#goChart").addEventListener("click", () => showView("board"));
 
 // ---------------------------------------------------------------- views
-const VIEWS = ["board", "orders", "accounts", "journal", "settings"];
+const VIEWS = ["board", "orders", "scanner", "bots", "portfolio", "accounts", "journal", "settings"];
 
 // The Accounts and Settings pages are fetched on first visit, so they add nothing to the page-load path.
 const pages = {};
@@ -240,9 +240,32 @@ function accountsPage() {
     return m;
   }));
 }
+function scannerPage() {
+  return (pages.scanner ??= import("./scanner.js").then((m) => {
+    m.init({
+      // a scan hit opens a research experiment (a prefilled backtest) in Bot Studio
+      onResearch: (r) => {
+        try {
+          sessionStorage.setItem("zb.research", JSON.stringify(r));
+        } catch {
+          /* storage unavailable */
+        }
+        showView("bots");
+      },
+    });
+    return m;
+  }));
+}
+function portfolioPage() {
+  return (pages.portfolio ??= import("./portfolio.js"));
+}
+function botsPage() {
+  return (pages.bots ??= import("./bots/studio.js").then((m) => (m.wire(), m)));
+}
 function settingsPage() {
   return (pages.settings ??= import("./settings.js").then((m) => (m.wire(), m)));
 }
+const devHub = () => (pages.dev ??= import("./devhub.js"));
 
 function showView(v) {
   if (!VIEWS.includes(v)) v = "board";
@@ -258,7 +281,13 @@ function showView(v) {
   if (v === "board") trading.render();
   else if (v === "journal") journal.load();
   else if (v === "accounts") accountsPage().then((m) => m.load(), onPageError);
-  else if (v === "settings") settingsPage().then((m) => m.load(), onPageError);
+  else if (v === "settings") {
+    settingsPage().then((m) => m.load(), onPageError);
+    devHub().then((m) => m.load(), onPageError);
+  }
+  else if (v === "bots") botsPage().then((m) => m.load(), onPageError);
+  else if (v === "scanner") scannerPage().then((m) => m.load(), onPageError);
+  else if (v === "portfolio") portfolioPage().then((m) => m.load(), onPageError);
 }
 const onPageError = (e) => view.banner(`Can't open this page: ${e.message}`, { err: true });
 $("#tabs").addEventListener("click", (e) => {
