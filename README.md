@@ -129,6 +129,15 @@ A page for building, testing and running trading bots on the **demo account** (v
 
 Bots run in the server (not the browser tab) and act on candle closes. Every bot order passes the kill switch, the account's limits, the bot's limits and the funds check. A restart pauses every bot. **Live trading is not available:** no broker order connector exists, so the order path refuses any non-paper account. Bots cannot start while sample data is on.
 
+## Research Lab and Operations
+
+Two pages added in phases 9 to 12 (details, API list and status per feature: `docs/ZONEBOARD_PHASES_9_12_PROGRESS.md`).
+
+- **Research Lab:** Monte Carlo (bootstrap, block, shuffle; seeded), walk-forward (rolling or anchored), a robustness score with its evidence, A/B tests of two strategies on the same window, rule-based market regimes, a bounded researcher whose candidates you approve or reject (approval publishes a strategy version, never a running bot), news and an economic calendar from your imports, a theoretical options lab (Black-Scholes, Greeks, payoffs) and a trade explainer that cites the records behind each fact. Long work runs as background jobs.
+- **Operations:** health of the runner, feeds, broker connections, jobs and the API, with incidents and notifications; portfolio-wide limits and an optional entry blackout around high-importance economic events; attribution and strategy drift; version diffs, tags and rollback; all accounts in one view with enable/disable; paper smart orders (TWAP and slices); an append-only ledger with reversals, yearly totals (calendar or Indian financial year), CSV export and statement reconciliation; and event-triggered workflows built from a small set of safe actions (no order, limit or arming action exists).
+
+Every new order path (smart-order children, workflows cannot place orders at all) passes the same central risk check as a manual order. Multi-user workspaces are not built: ZoneBoard stays a single-user, loopback-only app unless you decide otherwise.
+
 ## Backtest
 
 ```bash

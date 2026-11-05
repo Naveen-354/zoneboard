@@ -257,12 +257,42 @@ const scenarios = [
     assert(p.errors.length === 0, `console errors:\n    ${p.errors.join("\n    ")}`);
   }],
 
+  ["research lab and operations pages", async (p, url) => {
+    await p.load(url);
+    await waitBooted(p);
+    await p.eval(`document.querySelector('#tabs [data-v=lab]').click()`);
+    await p.waitFor(`document.querySelectorAll('#labTabs button').length === 9`, "research lab tabs");
+    for (const t of ["montecarlo", "walkforward", "robustness", "ab", "regimes", "researcher", "news", "options", "explain"]) {
+      await p.eval(`document.querySelector('#labTabs [data-v=${t}]').click()`);
+      await p.waitFor(`!/Loading/.test(document.querySelector('#labBody').textContent) && document.querySelector('#labBody .card') !== null`, `lab tab ${t}`);
+    }
+    // options lab computes a theoretical payoff; regimes classify sample data
+    await p.eval(`document.querySelector('#labTabs [data-v=options]').click()`);
+    await p.waitFor(`[...document.querySelectorAll('#labBody button')].some((b) => b.textContent === 'Analyse')`, "options form");
+    await p.eval(`[...document.querySelectorAll('#labBody button')].find((b) => b.textContent === 'Analyse').click()`);
+    await p.waitFor(`/THEORETICAL/.test(document.querySelector('#labBody').textContent) && document.querySelector('#labBody canvas') !== null`, "options analysis");
+    await p.eval(`document.querySelector('#labTabs [data-v=regimes]').click()`);
+    await p.waitFor(`[...document.querySelectorAll('#labBody button')].some((b) => b.textContent === 'Classify')`, "regime form");
+    await p.eval(`[...document.querySelectorAll('#labBody button')].find((b) => b.textContent === 'Classify').click()`);
+    await p.waitFor(`/rules-v1/.test(document.querySelector('#labBody').textContent) && /sample/i.test(document.querySelector('#labBody').textContent)`, "regime result labelled as sample data");
+    await p.eval(`document.querySelector('#tabs [data-v=ops]').click()`);
+    await p.waitFor(`document.querySelectorAll('#opsTabs button').length === 8`, "operations tabs");
+    for (const t of ["monitor", "risk", "attribution", "versions", "accounts", "smart", "ledger", "workflows"]) {
+      await p.eval(`document.querySelector('#opsTabs [data-v=${t}]').click()`);
+      await p.waitFor(`!/Loading/.test(document.querySelector('#opsBody').textContent) && document.querySelector('#opsBody .card, #opsBody .no-money') !== null`, `operations tab ${t}`);
+    }
+    await p.eval(`document.querySelector('#opsTabs [data-v=accounts]').click()`);
+    await p.waitFor(`/VIRTUAL/.test(document.querySelector('#opsBody').textContent)`, "demo account labelled VIRTUAL");
+    assert(!/st-msg err/.test(await p.eval(`[...document.querySelectorAll('#opsBody .st-msg.err')].map((x) => 'st-msg err ' + x.textContent).join(' ')`)), "no error messages on operations");
+    assert(p.errors.length === 0, `console errors:\n    ${p.errors.join("\n    ")}`);
+  }],
+
   ["mobile 375px: no horizontal scroll", async (p, url) => {
     await p.viewport(375, 812, true);
     try {
       await p.load(url);
       await waitBooted(p);
-      for (const view of ["board", "orders", "scanner", "bots", "portfolio", "accounts", "journal", "settings"]) {
+      for (const view of ["board", "orders", "scanner", "bots", "portfolio", "lab", "ops", "accounts", "journal", "settings"]) {
         await p.eval(`document.querySelector('#tabs [data-v=${view}]').click()`);
         await sleep(300);
         const m = await p.eval(`({ sw: document.documentElement.scrollWidth, cw: document.documentElement.clientWidth, bw: document.body.scrollWidth })`);

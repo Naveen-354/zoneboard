@@ -381,3 +381,12 @@ footer{padding:8px 18px 12px;color:var(--faint);font-size:11.5px}
 .ai-prop{display:grid;gap:6px}
 .ai-hist{display:grid;gap:6px}
 .ai-hist summary{font-size:12.5px;cursor:pointer}
+/* Research Lab and Operations: forms flow into columns, results nest in collapsible sections */
+.st-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px 12px;align-items:end}
+.st-form.wide{grid-template-columns:1fr}
+.st-form > .st-msg{grid-column:1/-1}
+.st-card textarea{width:100%;font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}
+.kv{display:grid;gap:8px;min-width:0}
+.kv details{border-left:2px solid var(--line);padding-left:10px}
+.kv summary{font-size:12.5px;font-weight:600;color:var(--ink-2);cursor:pointer;text-transform:capitalize}
+.lab-chart{min-width:0;overflow:hidden}

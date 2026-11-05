@@ -42,6 +42,8 @@
     <button type="button" data-v="scanner">Scanner</button>
     <button type="button" data-v="bots">Bot Studio</button>
     <button type="button" data-v="portfolio">Portfolio</button>
+    <button type="button" data-v="lab">Research Lab</button>
+    <button type="button" data-v="ops">Operations</button>
     <button type="button" data-v="accounts">Accounts</button>
     <button type="button" data-v="journal">Journal</button>
     <button type="button" data-v="settings">Settings</button>
@@ -165,6 +167,18 @@
 <main class="page studio" id="portfolioView" hidden>
   <div class="jhead"><div><b>Portfolio</b><span class="jsub">Accounts, attribution, exposure and reports</span></div></div>
   <div class="st-body" id="pfBody"></div>
+</main>
+
+<main class="page studio" id="labView" hidden>
+  <div class="jhead"><div><b>Research Lab</b><span class="jsub">Monte Carlo, walk-forward, robustness, A/B tests, regimes, research, news, options and trade evidence. Historical and theoretical, never orders.</span></div></div>
+  <nav class="seg st-tabs" id="labTabs" role="tablist" aria-label="Research Lab sections"></nav>
+  <div class="st-body" id="labBody"></div>
+</main>
+
+<main class="page studio" id="opsView" hidden>
+  <div class="jhead"><div><b>Operations</b><span class="jsub">Health, risk, attribution, versions, accounts, smart orders (paper), ledger and workflows</span></div></div>
+  <nav class="seg st-tabs" id="opsTabs" role="tablist" aria-label="Operations sections"></nav>
+  <div class="st-body" id="opsBody"></div>
 </main>
 
 <main class="page studio" id="botsView" hidden>
