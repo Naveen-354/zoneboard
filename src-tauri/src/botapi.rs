@@ -236,20 +236,20 @@ pub async fn library() -> Json<Value> {
 
 // ------------------------------------------------------------------ backtests
 
-struct BtReq {
-    spec: Value,
-    market: String,
-    symbol: String,
-    symbol2: Option<String>,
-    interval: String,
-    bars: usize,
-    cfg: Config,
-    bot_id: Option<i64>,
-    save: bool,
-    sample: bool,
+pub(crate) struct BtReq {
+    pub(crate) spec: Value,
+    pub(crate) market: String,
+    pub(crate) symbol: String,
+    pub(crate) symbol2: Option<String>,
+    pub(crate) interval: String,
+    pub(crate) bars: usize,
+    pub(crate) cfg: Config,
+    pub(crate) bot_id: Option<i64>,
+    pub(crate) save: bool,
+    pub(crate) sample: bool,
 }
 
-fn bt_request(s: &Shared, b: &Value) -> Result<BtReq, Response> {
+pub(crate) fn bt_request(s: &Shared, b: &Value) -> Result<BtReq, Response> {
     let bad = |m: &str| err(StatusCode::BAD_REQUEST, m);
     let m = b.as_object().ok_or_else(|| bad("request body must be a JSON object"))?;
     let bot = match m.get("bot_id").and_then(Value::as_i64) {
@@ -310,7 +310,7 @@ fn bt_request(s: &Shared, b: &Value) -> Result<BtReq, Response> {
     })
 }
 
-async fn frames(s: &Shared, r: &BtReq) -> Result<(Arc<Frame>, Option<Arc<Frame>>), Response> {
+pub(crate) async fn frames(s: &Shared, r: &BtReq) -> Result<(Arc<Frame>, Option<Arc<Frame>>), Response> {
     let a = s.data.bars(&r.market, &r.symbol, &r.interval, r.bars, r.sample, 300).await.map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("market data: {e}")))?;
     let b = match &r.symbol2 {
         Some(x) => Some(s.data.bars(&r.market, x, &r.interval, r.bars, r.sample, 300).await.map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("market data: {e}")))?),
@@ -319,7 +319,7 @@ async fn frames(s: &Shared, r: &BtReq) -> Result<(Arc<Frame>, Option<Arc<Frame>>
     Ok((a, b))
 }
 
-fn source_label(r: &BtReq) -> &'static str {
+pub(crate) fn source_label(r: &BtReq) -> &'static str {
     if r.sample {
         "SAMPLE DATA: made-up prices, for development only"
     } else if r.market == "crypto" {
@@ -1139,6 +1139,13 @@ pub const API_DOC: &[(&str, &str, &str)] = &[
     ("POST", "/api/strategy-versions/{id}/tags", "Tag a version"),
     ("POST", "/api/strategy-versions/{id}/rollback", "Roll back (publishes a new version)"),
     ("GET", "/api/jobs", "Background jobs"),
+    ("POST", "/api/research/montecarlo", "Monte Carlo job on a backtest's or bot's trades"),
+    ("POST", "/api/research/walkforward", "Walk-forward job (anchored or rolling)"),
+    ("POST", "/api/research/robustness", "Robustness assessment job"),
+    ("GET", "/api/research/robustness", "Stored robustness assessments"),
+    ("POST", "/api/research/experiments", "A/B experiment job (historical simulation)"),
+    ("POST", "/api/regimes/classify", "Classify market regimes (rules-v1)"),
+    ("GET", "/api/regimes/history", "Stored regime observations"),
     ("GET", "/api/jobs/{id}", "A job with its result"),
     ("POST", "/api/jobs/{id}/cancel", "Cancel a job"),
 ];

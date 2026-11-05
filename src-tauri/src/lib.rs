@@ -29,6 +29,8 @@ pub mod monitor;
 pub mod opsapi;
 pub mod orders;
 pub mod portfolio;
+pub mod regime;
+pub mod research;
 pub mod risk;
 pub mod riskintel;
 pub mod scanner;

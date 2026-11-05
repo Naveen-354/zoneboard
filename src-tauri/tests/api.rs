@@ -338,6 +338,13 @@ const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/api/system/health", "/api/system/health", None),
     ("GET", "/api/ai/status", "/api/ai/status", None),
     ("GET", "/api/scanner", "/api/scanner", None),
+    ("POST", "/api/research/montecarlo", "/api/research/montecarlo", Some(r#"{}"#)),
+    ("POST", "/api/research/walkforward", "/api/research/walkforward", Some(r#"{}"#)),
+    ("POST", "/api/research/robustness", "/api/research/robustness", Some(r#"{}"#)),
+    ("GET", "/api/research/robustness", "/api/research/robustness", None),
+    ("POST", "/api/research/experiments", "/api/research/experiments", Some(r#"{}"#)),
+    ("POST", "/api/regimes/classify", "/api/regimes/classify", Some(r#"{}"#)),
+    ("GET", "/api/regimes/history", "/api/regimes/history", None),
     ("GET", "/api/monitor", "/api/monitor", None),
     ("PUT", "/api/monitor/thresholds", "/api/monitor/thresholds", Some(r#"{}"#)),
     ("GET", "/api/events", "/api/events", None),
@@ -1267,4 +1274,51 @@ async fn phase9_operations_over_http() {
     let (s, _) = send(&r, "PUT", &format!("/api/bots/{}", bot["id"]), Some(json!({ "name": "late", "revision": 0 }))).await;
     assert_eq!(s, StatusCode::CONFLICT);
     assert_eq!(get_json(&r, &format!("/api/drift/{}", bot["id"])).await.1["status"], "insufficient_data");
+}
+
+async fn wait_job(r: &TestApp, id: i64) -> Value {
+    for _ in 0..200 {
+        let (_, j) = get_json(r, &format!("/api/jobs/{id}")).await;
+        if ["done", "failed", "cancelled"].contains(&j["status"].as_str().unwrap_or("")) {
+            return j;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("job {id} did not finish");
+}
+
+/// Phase 10 over HTTP: jobs for Monte Carlo (reproducible), walk-forward, robustness, A/B; regimes.
+#[tokio::test(flavor = "multi_thread")]
+async fn phase10_research_jobs_over_http() {
+    let r = router();
+    let lib = get_json(&r, "/api/strategies/library").await.1;
+    let spec = lib["templates"].as_array().unwrap().iter().find(|t| t["id"] == "ema_cross").unwrap()["spec"].clone();
+    let (_, bt) = send(&r, "POST", "/api/backtest", Some(json!({ "symbol": "BTCUSDT", "interval": "1h", "spec": spec, "bars": 800, "save": true }))).await;
+    let bid = bt["saved_id"].as_i64().unwrap();
+    let mc = json!({ "backtest_id": bid, "simulations": 500, "seed": 7, "method": "block" });
+    let (s, j1) = send(&r, "POST", "/api/research/montecarlo", Some(mc.clone())).await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{j1}");
+    let a = wait_job(&r, j1["job_id"].as_i64().unwrap()).await;
+    let (_, j2) = send(&r, "POST", "/api/research/montecarlo", Some(mc)).await;
+    let b = wait_job(&r, j2["job_id"].as_i64().unwrap()).await;
+    assert_eq!(a["status"], "done", "{a}");
+    assert_eq!(a["result"]["return_pct"], b["result"]["return_pct"], "same inputs and seed, same result");
+    let (_, wf) = send(&r, "POST", "/api/research/walkforward", Some(json!({ "symbol": "BTCUSDT", "interval": "1h", "spec": spec, "bars": 800, "mode": "rolling", "train_bars": 300, "test_bars": 100, "step_bars": 100, "params": [{ "path": "/indicators/0/params/period", "values": [5, 9] }] }))).await;
+    let w = wait_job(&r, wf["job_id"].as_i64().unwrap()).await;
+    assert_eq!(w["status"], "done", "{w}");
+    assert!(w["result"]["folds"].as_array().unwrap().len() >= 3);
+    let (_, rb) = send(&r, "POST", "/api/research/robustness", Some(json!({ "symbol": "BTCUSDT", "interval": "1h", "spec": spec, "bars": 800 }))).await;
+    let rb = wait_job(&r, rb["job_id"].as_i64().unwrap()).await;
+    assert_eq!(rb["status"], "done", "{rb}");
+    assert_eq!(get_json(&r, "/api/research/robustness").await.1["assessments"].as_array().unwrap().len(), 1);
+    let (_, ex) = send(&r, "POST", "/api/research/experiments", Some(json!({ "symbol": "BTCUSDT", "interval": "1h", "bars": 800, "a": spec, "b": spec, "min_trades": 5 }))).await;
+    let ex = wait_job(&r, ex["job_id"].as_i64().unwrap()).await;
+    assert_eq!(ex["result"]["a"]["metrics"], ex["result"]["b"]["metrics"]);
+    let (s, rg) = send(&r, "POST", "/api/regimes/classify", Some(json!({ "symbol": "BTCUSDT", "interval": "1h", "bars": 500 }))).await;
+    assert_eq!(s, StatusCode::OK, "{rg}");
+    assert_eq!(rg["rule_version"], "rules-v1");
+    assert!(rg["current"]["features"]["adx14"].is_number());
+    assert!(!get_json(&r, "/api/regimes/history?symbol=BTCUSDT&interval=1h").await.1["observations"].as_array().unwrap().is_empty());
+    // research never touched an account
+    assert_eq!(get_json(&r, "/api/positions?market=crypto&mode=demo").await.1["positions"].as_array().unwrap().len(), 0);
 }
