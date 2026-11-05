@@ -338,6 +338,22 @@ const API_ROUTES: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/api/system/health", "/api/system/health", None),
     ("GET", "/api/ai/status", "/api/ai/status", None),
     ("GET", "/api/scanner", "/api/scanner", None),
+    ("POST", "/api/accounts/{id}/status", "/api/accounts/999999/status", Some(r#"{}"#)),
+    ("GET", "/api/orchestrator", "/api/orchestrator", None),
+    ("POST", "/api/orchestrator/{id}/pause-bots", "/api/orchestrator/999999/pause-bots", Some(r#"{}"#)),
+    ("POST", "/api/smart-orders", "/api/smart-orders", Some(r#"{}"#)),
+    ("GET", "/api/smart-orders", "/api/smart-orders", None),
+    ("GET", "/api/smart-orders/{id}", "/api/smart-orders/999999", None),
+    ("POST", "/api/smart-orders/{id}/cancel", "/api/smart-orders/999999/cancel", Some(r#"{}"#)),
+    ("POST", "/api/smart-orders/{id}/resume", "/api/smart-orders/999999/resume", Some(r#"{}"#)),
+    ("POST", "/api/options/price", "/api/options/price", Some(r#"{}"#)),
+    ("POST", "/api/options/strategy", "/api/options/strategy", Some(r#"{}"#)),
+    ("GET", "/api/ledger", "/api/ledger", None),
+    ("POST", "/api/ledger/adjustments", "/api/ledger/adjustments", Some(r#"{}"#)),
+    ("POST", "/api/ledger/{id}/reverse", "/api/ledger/999999/reverse", Some(r#"{}"#)),
+    ("GET", "/api/ledger/report", "/api/ledger/report", None),
+    ("GET", "/api/ledger/export", "/api/ledger/export", None),
+    ("POST", "/api/ledger/reconcile", "/api/ledger/reconcile", Some(r#"{}"#)),
     ("POST", "/api/research/runs", "/api/research/runs", Some(r#"{}"#)),
     ("GET", "/api/research/runs", "/api/research/runs", None),
     ("POST", "/api/research/runs/{id}/review", "/api/research/runs/999999/review", Some(r#"{}"#)),
@@ -1406,4 +1422,69 @@ async fn phase11_intelligence_over_http() {
     assert_eq!(d["steps"].as_array().unwrap().len(), 3, "{d}");
     assert_eq!(send(&r, "POST", &format!("/api/workflows/{wid}/status"), Some(json!({ "status": "enabled" }))).await.0, StatusCode::OK);
     assert!(get_json(&r, "/api/notifications").await.1.to_string().contains("Volatility up") == false, "dry run notified nobody");
+}
+
+/// Phase 12 over HTTP: disabled accounts refuse orders, paper TWAP through the risk check, options lab,
+/// immutable ledger with reversal, export and reconciliation.
+#[tokio::test(flavor = "multi_thread")]
+async fn phase12_trading_ops_over_http() {
+    let r = router();
+    // a disabled account takes no orders; enabling restores it
+    assert_eq!(send(&r, "POST", "/api/accounts/demo-1/status", Some(json!({ "status": "disabled" }))).await.0, StatusCode::OK);
+    let (s, _, b) = call(&r, "POST", "/api/positions", "localhost", Some(order(json!({}))), &[]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&b).contains("disabled"));
+    let (s, sm) = send(&r, "POST", "/api/smart-orders", Some(json!({ "symbol": "BTCUSDT", "side": "long", "total_qty": 0.04, "children": 4, "interval_s": 60, "price": 78000 }))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "smart orders go through the same risk check: {sm}");
+    send(&r, "POST", "/api/accounts/demo-1/status", Some(json!({ "status": "active" }))).await;
+    assert_eq!(send(&r, "POST", "/api/accounts/demo-1/status", Some(json!({ "status": "armed" }))).await.0, StatusCode::BAD_REQUEST);
+    let o = get_json(&r, "/api/orchestrator").await.1;
+    assert!(o["accounts"].as_array().unwrap().iter().any(|a| a["account"]["id"] == "demo-1"), "{o}");
+
+    // TWAP: the first child fills at once on paper, the rest wait their turn; cancel stops the rest
+    let (s, p) = send(&r, "POST", "/api/smart-orders", Some(json!({ "symbol": "BTCUSDT", "side": "long", "total_qty": 0.04, "children": 4, "interval_s": 60, "price": 78000 }))).await;
+    assert_eq!(s, StatusCode::CREATED, "{p}");
+    assert_eq!(p["label"], "PAPER (simulated fills)");
+    let kids = p["children"].as_array().unwrap();
+    assert_eq!(kids.len(), 4);
+    assert_eq!(kids[0]["status"], "filled", "{p}");
+    assert!(kids[1..].iter().all(|k| k["status"] == "pending"));
+    assert_eq!(get_json(&r, "/api/positions?market=crypto&mode=demo").await.1["positions"].as_array().unwrap().len(), 1);
+    let id = p["id"].as_i64().unwrap();
+    let (_, c) = send(&r, "POST", &format!("/api/smart-orders/{id}/cancel"), Some(json!({}))).await;
+    assert_eq!(c["status"], "cancelled");
+    assert!((c["metrics"]["filled_pct"].as_f64().unwrap() - 25.0).abs() < 1e-9);
+    assert_eq!(send(&r, "POST", "/api/smart-orders", Some(json!({ "symbol": "BTCUSDT", "total_qty": 1, "children": 99, "price": 1 }))).await.0, StatusCode::BAD_REQUEST);
+
+    // options lab: theoretical and labelled
+    let (_, op) = send(&r, "POST", "/api/options/price", Some(json!({ "spot": 100, "strike": 100, "days": 365, "vol_pct": 20, "rate_pct": 5, "market_price": 10.4506 }))).await;
+    assert!((op["price"].as_f64().unwrap() - 10.4506).abs() < 1e-3, "{op}");
+    assert!((op["implied_vol_pct"].as_f64().unwrap() - 20.0).abs() < 0.01);
+    assert!(op["label"].as_str().unwrap().starts_with("THEORETICAL"));
+    let (s, st) = send(&r, "POST", "/api/options/strategy", Some(json!({ "spot": 100, "days": 30, "template": "iron_condor", "width": 5 }))).await;
+    assert_eq!(s, StatusCode::OK, "{st}");
+    assert_eq!(st["legs"].as_array().unwrap().len(), 4);
+    assert_eq!(send(&r, "POST", "/api/options/strategy", Some(json!({ "spot": -5, "template": "long_call" }))).await.0, StatusCode::BAD_REQUEST);
+
+    // ledger: a closed trade becomes entries; reversal once; export and reconcile
+    let open = get_json(&r, "/api/positions?market=crypto&mode=demo").await.1["positions"][0].clone();
+    let (pos, entry) = (open["id"].as_i64().unwrap(), open["entry"].as_f64().unwrap());
+    assert_eq!(entry, kids[0]["price"].as_f64().unwrap(), "the child filled at the latest price (sample data here)");
+    call(&r, "POST", &format!("/api/positions/{pos}/close"), "localhost", Some(json!({"price": 79000, "date": "2026-11-02"})), &[]).await;
+    let l = get_json(&r, "/api/ledger").await.1;
+    let entries = l["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{l}");
+    let pnl = entries.iter().find(|e| e["kind"] == "realised_pnl").unwrap();
+    assert!((pnl["amount"].as_str().unwrap().parse::<f64>().unwrap() - (79000.0 - entry) * 0.01).abs() < 1e-6, "{pnl}");
+    let eid = pnl["id"].as_i64().unwrap();
+    assert_eq!(send(&r, "POST", &format!("/api/ledger/{eid}/reverse"), Some(json!({ "memo": "test reversal" }))).await.0, StatusCode::OK);
+    assert_eq!(send(&r, "POST", &format!("/api/ledger/{eid}/reverse"), Some(json!({ "memo": "again" }))).await.0, StatusCode::BAD_REQUEST);
+    let rep = get_json(&r, "/api/ledger/report?basis=india_fy").await.1;
+    assert_eq!(rep["rows"][0]["year"], "FY2026-27");
+    let (s, h, body) = call(&r, "GET", "/api/ledger/export", "localhost", None, &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/csv"));
+    assert_eq!(String::from_utf8_lossy(&body).lines().count(), 4);
+    let (_, rc) = send(&r, "POST", "/api/ledger/reconcile", Some(json!({ "account_id": "demo-1", "csv": format!("date,symbol,side,qty,price\n2026-11-02,BTCUSDT,buy,0.01,{entry}\n") }))).await;
+    assert_eq!(rc["matched"].as_array().unwrap().len(), 1, "{rc}");
 }

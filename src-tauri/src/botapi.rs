@@ -658,6 +658,7 @@ pub async fn run_forever(s: Shared) {
         every.tick().await;
         let t = std::time::Instant::now();
         tick(&s).await;
+        crate::tradeapi::smart_tick(&s).await;
         crate::opsapi::housekeeping(&s);
         let running = s.journal.with_conn(|c| bots::ids_with_status(c, &["running", "paused"]).len());
         heartbeat(&s, json!({ "bots_active": running, "tick_ms": t.elapsed().as_millis() as u64, "every_s": RUNNER_EVERY.as_secs() }));
@@ -1139,6 +1140,22 @@ pub const API_DOC: &[(&str, &str, &str)] = &[
     ("POST", "/api/strategy-versions/{id}/tags", "Tag a version"),
     ("POST", "/api/strategy-versions/{id}/rollback", "Roll back (publishes a new version)"),
     ("GET", "/api/jobs", "Background jobs"),
+    ("POST", "/api/accounts/{id}/status", "Enable or disable an account for new orders"),
+    ("GET", "/api/orchestrator", "All accounts: status, positions, bots, smart orders, limits"),
+    ("POST", "/api/orchestrator/{id}/pause-bots", "Pause every running bot on one account"),
+    ("POST", "/api/smart-orders", "Create a paper TWAP or sliced parent order"),
+    ("GET", "/api/smart-orders", "Parent orders with children and execution metrics"),
+    ("GET", "/api/smart-orders/{id}", "One parent order"),
+    ("POST", "/api/smart-orders/{id}/cancel", "Cancel a parent order's pending children"),
+    ("POST", "/api/smart-orders/{id}/resume", "Resume a paused parent order"),
+    ("POST", "/api/options/price", "Black-Scholes price, Greeks and implied volatility (theoretical)"),
+    ("POST", "/api/options/strategy", "Multi-leg payoff, breakevens and Greeks (theoretical)"),
+    ("GET", "/api/ledger", "Ledger entries (synced from closed trades)"),
+    ("POST", "/api/ledger/adjustments", "Add an adjustment entry with a memo"),
+    ("POST", "/api/ledger/{id}/reverse", "Reverse a ledger entry (once)"),
+    ("GET", "/api/ledger/report", "Yearly totals (calendar or Indian FY)"),
+    ("GET", "/api/ledger/export", "Ledger as CSV"),
+    ("POST", "/api/ledger/reconcile", "Reconcile a broker statement CSV"),
     ("POST", "/api/research/runs", "Start a bounded research run (job)"),
     ("GET", "/api/research/runs", "Research runs with reports and review status"),
     ("POST", "/api/research/runs/{id}/review", "Approve (publish a version) or reject a research candidate"),

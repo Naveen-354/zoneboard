@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 use crate::botapi;
 use crate::intelapi;
 use crate::opsapi;
+use crate::tradeapi;
 use crate::data::{self, DataStore};
 use crate::journal::{self, Journal};
 use crate::zones::{self, Label, Summary};
@@ -121,6 +122,7 @@ impl AppState {
         journal.with_conn(|conn| {
             crate::bots::pause_all_on_start(conn);
             crate::jobs::fail_interrupted(conn);
+            crate::smartexec::pause_all_on_start(conn);
         });
         let api_token = generate_api_token();
         Ok(Arc::new(Self {
@@ -249,6 +251,21 @@ pub fn app(state: Shared) -> Router {
         .route("/api/workflows/{id}", get(intelapi::workflow_get).put(intelapi::workflow_save))
         .route("/api/workflows/{id}/status", post(intelapi::workflow_status))
         .route("/api/workflows/{id}/dryrun", post(intelapi::workflow_dry_run))
+        .route("/api/accounts/{id}/status", post(tradeapi::account_status))
+        .route("/api/orchestrator", get(tradeapi::orchestrator))
+        .route("/api/orchestrator/{id}/pause-bots", post(tradeapi::orchestrator_pause))
+        .route("/api/smart-orders", post(tradeapi::smart_create).get(tradeapi::smart_list))
+        .route("/api/smart-orders/{id}", get(tradeapi::smart_get))
+        .route("/api/smart-orders/{id}/cancel", post(tradeapi::smart_cancel))
+        .route("/api/smart-orders/{id}/resume", post(tradeapi::smart_resume))
+        .route("/api/options/price", post(tradeapi::options_price))
+        .route("/api/options/strategy", post(tradeapi::options_strategy))
+        .route("/api/ledger", get(tradeapi::ledger_entries))
+        .route("/api/ledger/adjustments", post(tradeapi::ledger_adjust))
+        .route("/api/ledger/{id}/reverse", post(tradeapi::ledger_reverse))
+        .route("/api/ledger/report", get(tradeapi::ledger_report))
+        .route("/api/ledger/export", get(tradeapi::ledger_export))
+        .route("/api/ledger/reconcile", post(tradeapi::ledger_reconcile))
         .route("/api/scanner", get(botapi::scanner_catalog))
         .route("/api/dev/tokens", get(botapi::dev_tokens).post(botapi::dev_token_create))
         .route("/api/dev/tokens/{id}", delete(botapi::dev_token_revoke))

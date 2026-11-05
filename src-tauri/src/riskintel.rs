@@ -71,6 +71,10 @@ pub fn demo_drawdown(conn: &Connection, currency: &str) -> (Decimal, Decimal, f6
 
 /// Checks run by `risk::check_limits` before the original ones.
 pub fn extra_checks(conn: &Connection, o: &Order) -> Result<(), String> {
+    let status: String = conn.query_row("SELECT status FROM accounts WHERE id = ?1", [&o.account_id], |r| r.get(0)).unwrap_or_else(|_| "active".into());
+    if status == "disabled" {
+        return Err(format!("account {} is disabled: enable it in Operations > Accounts to trade on it", o.account_id));
+    }
     if let Some(e) = crate::intel::blackout_hit(conn, &o.market, chrono::Utc::now()) {
         return Err(format!("economic-event blackout: {e}; new entries are paused around high-importance events"));
     }
