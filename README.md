@@ -1,4 +1,4 @@
-# ZoneBoard
+ # ZoneBoard
 
 A personal scanner, chart, journal and backtester for **live crypto** and **delayed NSE stocks**, for learning how markets move.
 
